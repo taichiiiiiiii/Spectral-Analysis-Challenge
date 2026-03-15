@@ -1,4 +1,8 @@
-"""スペクトル分析モジュール（Issue #2）"""
+"""スペクトル分析モジュール
+
+対応Issue: #2 スペクトルの可視化（樹種別・含水率別）
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/2
+"""
 import numpy as np
 import pandas as pd
 

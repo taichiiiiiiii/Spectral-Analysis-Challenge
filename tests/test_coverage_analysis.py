@@ -1,4 +1,8 @@
-"""含水率カバレッジ分析のテスト（Issue #12）"""
+"""含水率カバレッジ分析のテスト
+
+対応Issue: #12 含水率カバレッジの確認（train vs test の外挿リスク）
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/12
+"""
 import pytest
 import pandas as pd
 import numpy as np

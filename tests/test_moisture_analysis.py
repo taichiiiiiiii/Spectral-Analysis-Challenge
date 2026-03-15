@@ -1,4 +1,8 @@
-"""含水率分析のテスト（Issue #3: 含水率の分布確認）"""
+"""含水率分析のテスト
+
+対応Issue: #3 含水率の分布確認
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/3
+"""
 import pytest
 import pandas as pd
 import numpy as np

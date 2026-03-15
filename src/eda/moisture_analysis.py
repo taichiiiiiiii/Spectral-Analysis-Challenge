@@ -1,4 +1,8 @@
-"""含水率分析モジュール（Issue #3）"""
+"""含水率分析モジュール
+
+対応Issue: #3 含水率の分布確認
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/3
+"""
 import numpy as np
 import pandas as pd
 from scipy import stats

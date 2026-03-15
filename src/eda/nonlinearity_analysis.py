@@ -1,4 +1,8 @@
-"""非線形性分析モジュール（Issue #10）"""
+"""非線形性分析モジュール
+
+対応Issue: #10 含水率とスペクトルの非線形性確認
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/10
+"""
 import numpy as np
 import pandas as pd
 

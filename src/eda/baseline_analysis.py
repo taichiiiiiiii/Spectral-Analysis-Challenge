@@ -1,4 +1,8 @@
-"""ベースラインドリフト・多重共線性分析モジュール（Issue #11）"""
+"""ベースラインドリフト・多重共線性分析モジュール
+
+対応Issue: #11 ベースラインドリフトと多重共線性の確認
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/11
+"""
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler

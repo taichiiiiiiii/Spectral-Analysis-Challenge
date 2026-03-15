@@ -1,4 +1,8 @@
-"""針葉樹 vs 広葉樹分析のテスト（Issue #9）"""
+"""針葉樹 vs 広葉樹分析のテスト
+
+対応Issue: #9 針葉樹 vs 広葉樹のスペクトル特性分析
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/9
+"""
 import pytest
 import pandas as pd
 import numpy as np

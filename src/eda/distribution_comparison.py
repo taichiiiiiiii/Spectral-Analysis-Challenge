@@ -1,4 +1,8 @@
-"""train/test分布比較モジュール（Issue #4）"""
+"""train/test分布比較モジュール
+
+対応Issue: #4 train/testのスペクトル分布比較（ドメインシフト確認）
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/4
+"""
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler

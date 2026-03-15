@@ -1,4 +1,8 @@
-"""スペクトル異常値検出モジュール（Issue #8）"""
+"""スペクトル異常値検出モジュール
+
+対応Issue: #8 スペクトル異常値の検出（Hotelling's T²・Q残差）
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/8
+"""
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler

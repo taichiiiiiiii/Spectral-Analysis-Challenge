@@ -1,4 +1,8 @@
-"""非線形性分析のテスト（Issue #10）"""
+"""非線形性分析のテスト
+
+対応Issue: #10 含水率とスペクトルの非線形性確認
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/10
+"""
 import pytest
 import pandas as pd
 import numpy as np

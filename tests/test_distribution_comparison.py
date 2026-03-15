@@ -1,4 +1,8 @@
-"""train/test分布比較のテスト（Issue #4: ドメインシフト確認）"""
+"""train/test分布比較のテスト
+
+対応Issue: #4 train/testのスペクトル分布比較（ドメインシフト確認）
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/4
+"""
 import pytest
 import pandas as pd
 import numpy as np

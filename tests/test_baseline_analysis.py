@@ -1,4 +1,8 @@
-"""ベースラインドリフト・多重共線性のテスト（Issue #11）"""
+"""ベースラインドリフト・多重共線性のテスト
+
+対応Issue: #11 ベースラインドリフトと多重共線性の確認
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/11
+"""
 import pytest
 import pandas as pd
 import numpy as np

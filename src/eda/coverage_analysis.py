@@ -1,4 +1,8 @@
-"""含水率カバレッジ分析モジュール（Issue #12）"""
+"""含水率カバレッジ分析モジュール
+
+対応Issue: #12 含水率カバレッジの確認（train vs test の外挿リスク）
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/12
+"""
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler

@@ -1,4 +1,8 @@
-"""スペクトル異常値検出のテスト（Issue #8）"""
+"""スペクトル異常値検出のテスト
+
+対応Issue: #8 スペクトル異常値の検出（Hotelling's T²・Q残差）
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/8
+"""
 import pytest
 import pandas as pd
 import numpy as np

@@ -1,4 +1,8 @@
-"""スペクトル分析のテスト（Issue #2: スペクトルの可視化）"""
+"""スペクトル分析のテスト
+
+対応Issue: #2 スペクトルの可視化（樹種別・含水率別）
+https://github.com/taichiiiiiiii/Spectral-Analysis-Challenge/issues/2
+"""
 import pytest
 import pandas as pd
 import numpy as np
