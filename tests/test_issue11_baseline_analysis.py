@@ -9,7 +9,7 @@ import numpy as np
 from pathlib import Path
 
 from src.eda.data_loader import load_train, get_spectral_columns
-from src.eda.baseline_analysis import (
+from src.eda.issue11_baseline_analysis import (
     compute_baseline_drift,
     compute_effective_rank,
     compute_adjacent_correlation,

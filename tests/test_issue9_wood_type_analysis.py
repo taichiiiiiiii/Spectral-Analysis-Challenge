@@ -9,7 +9,7 @@ import numpy as np
 from pathlib import Path
 
 from src.eda.data_loader import load_train, load_test, get_spectral_columns
-from src.eda.wood_type_analysis import (
+from src.eda.issue9_wood_type_analysis import (
     assign_wood_type,
     compute_mean_spectrum_by_wood_type,
     compute_moisture_stats_by_wood_type,

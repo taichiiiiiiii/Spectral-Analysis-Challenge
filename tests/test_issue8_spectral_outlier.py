@@ -9,7 +9,7 @@ import numpy as np
 from pathlib import Path
 
 from src.eda.data_loader import load_train, get_spectral_columns
-from src.eda.spectral_outlier import (
+from src.eda.issue8_spectral_outlier import (
     compute_pca_for_outlier,
     compute_hotelling_t2,
     compute_q_residuals,

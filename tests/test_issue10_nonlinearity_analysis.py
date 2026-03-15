@@ -9,7 +9,7 @@ import numpy as np
 from pathlib import Path
 
 from src.eda.data_loader import load_train, get_spectral_columns, get_wavenumbers
-from src.eda.nonlinearity_analysis import (
+from src.eda.issue10_nonlinearity_analysis import (
     compute_correlation_by_moisture_range,
     compare_linear_vs_log_correlation,
     find_most_nonlinear_wavenumbers,

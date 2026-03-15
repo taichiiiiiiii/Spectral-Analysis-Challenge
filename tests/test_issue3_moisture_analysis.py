@@ -9,7 +9,7 @@ import numpy as np
 from pathlib import Path
 
 from src.eda.data_loader import load_train
-from src.eda.moisture_analysis import (
+from src.eda.issue3_moisture_analysis import (
     compute_moisture_stats,
     compute_moisture_stats_by_species,
     detect_outliers,

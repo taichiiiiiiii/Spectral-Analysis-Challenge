@@ -9,7 +9,7 @@ import numpy as np
 from pathlib import Path
 
 from src.eda.data_loader import load_train, load_test, get_spectral_columns
-from src.eda.coverage_analysis import (
+from src.eda.issue12_coverage_analysis import (
     compute_pc_coverage,
     assess_extrapolation_risk,
     compute_moisture_range_coverage,

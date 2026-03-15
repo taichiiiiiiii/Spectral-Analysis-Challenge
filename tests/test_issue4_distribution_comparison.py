@@ -9,7 +9,7 @@ import numpy as np
 from pathlib import Path
 
 from src.eda.data_loader import load_train, load_test, get_spectral_columns
-from src.eda.distribution_comparison import (
+from src.eda.issue4_distribution_comparison import (
     compute_pca_projection,
     compute_spectral_statistics,
     compute_domain_shift_score,

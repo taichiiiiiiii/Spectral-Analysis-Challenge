@@ -9,7 +9,7 @@ import numpy as np
 from pathlib import Path
 
 from src.eda.data_loader import load_train, get_spectral_columns, get_wavenumbers
-from src.eda.spectrum_analysis import (
+from src.eda.issue2_spectrum_analysis import (
     compute_mean_spectrum_by_species,
     compute_mean_spectrum_by_moisture_range,
     compute_spectral_correlation_with_moisture,
