@@ -162,15 +162,104 @@ Raw → [SNV or MSC] → [1次 or 2次微分] → [波数範囲選択]
 
 ---
 
-## ディレクトリ構成
+## ディレクトリ構成（developブランチ）
 
 ```
 .
-├── Input_data/
-│   ├── train.csv
-│   ├── test.csv
-│   └── sample_submit.csv
-├── notebooks/          # 実験ノートブック
-├── src/                # 実装コード
-└── README.md
+├── Input_data/                  # コンペティション入力データ
+│   ├── train.csv                #   学習データ（1,322サンプル）
+│   ├── test.csv                 #   評価データ（550サンプル）
+│   └── sample_submit.csv        #   提出サンプル
+│
+├── src/                         # モジュール本体
+│   ├── eda/                     #   EDA分析（Issue #2〜#17）
+│   │   ├── data_loader.py       #     データ読み込み共通ユーティリティ
+│   │   ├── issue2_spectrum_analysis.py
+│   │   ├── issue3_moisture_analysis.py
+│   │   ├── issue4_distribution_comparison.py
+│   │   ├── issue8_spectral_outlier.py
+│   │   ├── issue9_wood_type_analysis.py
+│   │   ├── issue10_nonlinearity_analysis.py
+│   │   ├── issue11_baseline_analysis.py
+│   │   ├── issue12_coverage_analysis.py
+│   │   ├── issue13_loso_cv_validity.py
+│   │   ├── issue14_absorption_bands.py
+│   │   ├── issue15_pls_components.py
+│   │   ├── issue16_cv_map.py
+│   │   └── issue17_drying_speed.py
+│   │
+│   ├── preprocessing/           #   スペクトル前処理（Issue #18〜#25, #38〜#50）
+│   │   ├── issue18_snv.py       #     SNV
+│   │   ├── issue19_msc.py       #     MSC
+│   │   ├── issue20_savgol.py    #     Savitzky-Golay微分
+│   │   ├── issue21_preprocessing_comparison.py
+│   │   ├── issue22_epo.py       #     EPO
+│   │   ├── issue23_osc.py       #     OSC
+│   │   ├── issue24_detrending.py
+│   │   ├── issue25_emsc.py      #     EMSC
+│   │   ├── issue38_tca.py       #     TCA
+│   │   ├── issue39_wavelet_transform.py
+│   │   ├── issue40_opls.py      #     OPLS
+│   │   ├── issue43_dipls.py     #     di-PLS
+│   │   ├── issue44_subspace_alignment.py
+│   │   ├── issue45_constituent_emsc.py
+│   │   ├── issue46_mmd_selection.py
+│   │   ├── issue47_jsmkpls.py   #     JSMKPLS
+│   │   ├── issue48_jda.py       #     JDA
+│   │   ├── issue49_bda.py       #     BDA
+│   │   ├── issue50_kmm.py       #     KMM
+│   │   └── issue50_weighted_tca.py
+│   │
+│   ├── modeling/                #   モデリング（Issue #26〜#34）
+│   │   ├── issue26_pls_epo_optimization.py
+│   │   ├── issue27_nonlinear_models.py
+│   │   ├── issue28_domain_adaptation.py
+│   │   ├── issue29_epo_preprocessing_combo.py
+│   │   ├── issue30_stacking.py
+│   │   ├── issue31_submission_pipeline.py
+│   │   ├── issue32_weighted_ensemble.py
+│   │   ├── issue33_lwpls.py
+│   │   └── issue34_test_augmented_epo.py
+│   │
+│   └── feature_engineering/     #   特徴量エンジニアリング（Issue #37, #41）
+│       ├── issue37_species_invariant.py
+│       └── issue41_spectral_autocorrelation.py
+│
+├── scripts/                     # 実行スクリプト（run_*）
+│   ├── eda/
+│   │   └── run_all_eda.py       #     全EDA一括実行
+│   ├── preprocessing/
+│   │   └── run_issue22_25.py    #     前処理 #22-25 一括実行
+│   ├── modeling/
+│   │   ├── run_issue26.py       #     PLS+EPOグリッドサーチ
+│   │   ├── run_issue27_29.py    #     非線形モデル + EPO組合せ
+│   │   ├── run_issue28.py       #     ドメイン適応評価
+│   │   ├── run_issue30.py       #     スタッキング評価
+│   │   ├── run_issue31.py       #     提出ファイル生成
+│   │   ├── run_issue32_improved_ensemble.py
+│   │   ├── run_issue33_34.py    #     LWPLS + Test-Aug EPO
+│   │   ├── run_deep_dive.py     #     前処理深掘り
+│   │   ├── run_deep_dive_part2.py
+│   │   ├── run_deep_dive_part3.py
+│   │   ├── run_da_deep_dive.py  #     ドメイン適応深掘り (JDA/BDA/WTCA)
+│   │   ├── run_improved_ensemble_v2.py
+│   │   ├── run_new_preprocessing_eval.py   # 新規前処理評価
+│   │   ├── run_new_preprocessing_eval2.py
+│   │   ├── run_new_preprocessing_eval3.py
+│   │   ├── run_new_preprocessing_eval3b.py
+│   │   ├── run_new_preprocessing_eval3c.py
+│   │   └── run_submission_v2.py #     改良版提出 (RMSE=17.03)
+│   └── feature_engineering/
+│       └── run_issue37.py       #     樹種不変特徴量評価
+│
+├── outputs/                     # 可視化・分析結果
+│   ├── eda/                     #     EDA可視化 (15 PNG)
+│   ├── preprocessing/           #     前処理可視化 (8 PNG)
+│   ├── modeling/                #     モデリング可視化 (8 PNG)
+│   └── feature_engineering/     #     特徴量可視化 (1 PNG)
+│
+├── tests/                       # ユニットテスト（全issue番号付き、38ファイル）
+├── main.py                      # メインエントリポイント
+├── pyproject.toml               # プロジェクト設定
+└── uv.lock                      # 依存関係ロック
 ```
