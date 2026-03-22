@@ -212,17 +212,8 @@ def build_experiment_configs():
                 "target_transform": "log1p",
             })
 
-    # SNV+AsLS(1e6)は代表的な成分数のみ（計算コスト対策）
-    for n_pls in [4, 6]:
-        configs.append({
-            "preprocess": "SNV+AsLS(1e6)",
-            "n_pls": n_pls,
-            "hidden_layers": (50, 25),
-            "activation": "relu",
-            "alpha": 0.01,
-            "lr_init": 0.01,
-            "target_transform": "log1p",
-        })
+    # SNV+AsLS(1e6)は計算コストが非常に高いため除外
+    # （AsLSは1サンプルあたり反復最適化が必要で、13-fold CVでは非現実的）
 
     # --- グループ2: MLP構造のスイープ（固定前処理: SNV, PLS=6） ---
     for hidden in [(50,), (100,), (50, 25), (100, 50), (100, 50, 25)]:
