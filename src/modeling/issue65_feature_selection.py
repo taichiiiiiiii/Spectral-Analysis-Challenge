@@ -280,29 +280,30 @@ def run_feature_selection_experiment(X_raw, y, groups):
         ("SNV+AsLS(1e6)", preprocess_snv_asls, {"lam": 1e6}),
     ]
 
-    # 特徴量選択定義: (名前, 関数, kwargs)
-    # 関数シグネチャ: fn(X_train, y_train, X_test, **kwargs) -> (X_tr_sel, X_te_sel, indices)
+    # 特徴量選択定義: (名前, 関数, kwargs, y_dependent)
+    # y_dependent=True: 特徴量選択がyに依存する → raw/sqrtで別々に実行
+    # y_dependent=False: yに依存しない or rawのyで選択して共有
     fs_configs = [
-        ("None", None, {}),
-        # VIP
-        ("VIP(>0.8)", vip_select, {"threshold": 0.8, "n_components": 3}),
-        ("VIP(>1.0)", vip_select, {"threshold": 1.0, "n_components": 3}),
-        ("VIP(>1.2)", vip_select, {"threshold": 1.2, "n_components": 3}),
-        ("VIP(>1.5)", vip_select, {"threshold": 1.5, "n_components": 3}),
-        # CARS
-        ("CARS(n=20,pls=2)", cars_select, {"n_pls": 2, "n_iterations": 20}),
-        ("CARS(n=30,pls=3)", cars_select, {"n_pls": 3, "n_iterations": 30}),
-        ("CARS(n=50,pls=4)", cars_select, {"n_pls": 4, "n_iterations": 50}),
-        # iPLS
-        ("iPLS(int=10)", ipls_select, {"n_intervals": 10, "n_components": 3, "n_best": 1}),
-        ("iPLS(int=20)", ipls_select, {"n_intervals": 20, "n_components": 3, "n_best": 1}),
-        ("iPLS(int=30)", ipls_select, {"n_intervals": 30, "n_components": 3, "n_best": 1}),
-        ("iPLS(int=50)", ipls_select, {"n_intervals": 50, "n_components": 3, "n_best": 1}),
-        # siPLS
-        ("siPLS(int=10,c=2)", sipls_select, {"n_intervals": 10, "n_components": 3, "n_combine": 2}),
-        ("siPLS(int=20,c=3)", sipls_select, {"n_intervals": 20, "n_components": 3, "n_combine": 3}),
-        ("siPLS(int=30,c=3)", sipls_select, {"n_intervals": 30, "n_components": 3, "n_combine": 3}),
-        ("siPLS(int=20,c=4)", sipls_select, {"n_intervals": 20, "n_components": 3, "n_combine": 4}),
+        ("None", None, {}, False),
+        # VIP (y依存)
+        ("VIP(>0.8)", vip_select, {"threshold": 0.8, "n_components": 3}, True),
+        ("VIP(>1.0)", vip_select, {"threshold": 1.0, "n_components": 3}, True),
+        ("VIP(>1.2)", vip_select, {"threshold": 1.2, "n_components": 3}, True),
+        ("VIP(>1.5)", vip_select, {"threshold": 1.5, "n_components": 3}, True),
+        # CARS (y依存だがraw yで選択を共有して高速化)
+        ("CARS(n=20,pls=2)", cars_select, {"n_pls": 2, "n_iterations": 20}, False),
+        ("CARS(n=30,pls=3)", cars_select, {"n_pls": 3, "n_iterations": 30}, False),
+        ("CARS(n=50,pls=4)", cars_select, {"n_pls": 4, "n_iterations": 50}, False),
+        # iPLS (raw yで選択を共有)
+        ("iPLS(int=10)", ipls_select, {"n_intervals": 10, "n_components": 3, "n_best": 1}, False),
+        ("iPLS(int=20)", ipls_select, {"n_intervals": 20, "n_components": 3, "n_best": 1}, False),
+        ("iPLS(int=30)", ipls_select, {"n_intervals": 30, "n_components": 3, "n_best": 1}, False),
+        ("iPLS(int=50)", ipls_select, {"n_intervals": 50, "n_components": 3, "n_best": 1}, False),
+        # siPLS (raw yで選択を共有)
+        ("siPLS(int=10,c=2)", sipls_select, {"n_intervals": 10, "n_components": 3, "n_combine": 2}, False),
+        ("siPLS(int=20,c=3)", sipls_select, {"n_intervals": 20, "n_components": 3, "n_combine": 3}, False),
+        ("siPLS(int=30,c=3)", sipls_select, {"n_intervals": 30, "n_components": 3, "n_combine": 3}, False),
+        ("siPLS(int=20,c=4)", sipls_select, {"n_intervals": 20, "n_components": 3, "n_combine": 4}, False),
     ]
 
     models = ["PLS(2)", "PLS(3)", "PLS(4)", "Lasso(0.1)", "ElasticNet(0.1)"]
@@ -337,14 +338,13 @@ def run_feature_selection_experiment(X_raw, y, groups):
         print(f"  前処理キャッシュ完了: {time.time()-t0:.1f}秒")
 
         # 各特徴量選択を適用
-        for fs_idx, (fs_name, fs_fn, fs_kwargs) in enumerate(fs_configs):
+        for fs_idx, (fs_name, fs_fn, fs_kwargs, y_dep) in enumerate(fs_configs):
             t1 = time.time()
 
             # LOSOフォールドごとに特徴量選択結果をキャッシュ
             fs_cache = []
             for fold_data in pp_cache:
                 y_train_raw = fold_data["y_train"]
-                y_train_sqrt = np.sqrt(y_train_raw)
 
                 if fs_fn is None:
                     # 選択なし
@@ -354,15 +354,27 @@ def run_feature_selection_experiment(X_raw, y, groups):
                         "n_feat_raw": fold_data["X_train"].shape[1],
                         "n_feat_sqrt": fold_data["X_train"].shape[1],
                     })
-                else:
+                elif y_dep:
+                    # y依存: raw/sqrtで別々に実行
                     entry = {}
-                    for tfm, y_fit in [("raw", y_train_raw), ("sqrt", y_train_sqrt)]:
+                    for tfm, y_fit in [("raw", y_train_raw), ("sqrt", np.sqrt(y_train_raw))]:
                         X_tr_sel, X_te_sel, _ = fs_fn(
                             fold_data["X_train"], y_fit, fold_data["X_test"], **fs_kwargs
                         )
                         entry[tfm] = (X_tr_sel, X_te_sel)
                         entry[f"n_feat_{tfm}"] = X_tr_sel.shape[1]
                     fs_cache.append(entry)
+                else:
+                    # y非依存 or raw yで共有: 1回だけ実行
+                    X_tr_sel, X_te_sel, _ = fs_fn(
+                        fold_data["X_train"], y_train_raw, fold_data["X_test"], **fs_kwargs
+                    )
+                    fs_cache.append({
+                        "raw": (X_tr_sel, X_te_sel),
+                        "sqrt": (X_tr_sel, X_te_sel),
+                        "n_feat_raw": X_tr_sel.shape[1],
+                        "n_feat_sqrt": X_tr_sel.shape[1],
+                    })
 
             fs_time = time.time() - t1
 
