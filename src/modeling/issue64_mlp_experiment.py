@@ -151,13 +151,15 @@ def run_single_config(
             mlp = MLPRegressor(
                 hidden_layer_sizes=hidden_layers,
                 activation=activation,
+                solver="adam",
                 alpha=alpha,
                 learning_rate_init=learning_rate_init,
-                max_iter=2000,
+                max_iter=1000,
                 early_stopping=True,
                 validation_fraction=0.15,
                 random_state=random_state,
-                n_iter_no_change=20,
+                n_iter_no_change=15,
+                batch_size="auto",
             )
             mlp.fit(T_train_s, y_train_t)
 
