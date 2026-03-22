@@ -153,13 +153,14 @@ def run_single_config(
                 activation=activation,
                 solver="adam",
                 alpha=alpha,
+                learning_rate="adaptive",
                 learning_rate_init=learning_rate_init,
-                max_iter=1000,
+                max_iter=500,
                 early_stopping=True,
                 validation_fraction=0.15,
                 random_state=random_state,
-                n_iter_no_change=15,
-                batch_size="auto",
+                n_iter_no_change=10,
+                batch_size=min(200, max(len(y_train_t) // 5, 32)),
             )
             mlp.fit(T_train_s, y_train_t)
 
@@ -199,16 +200,15 @@ def build_experiment_configs():
     configs = []
 
     # --- グループ1: 前処理×PLS成分数のスイープ（固定MLP設定） ---
-    # 高速な前処理で広くスイープ
     for prep in ["SNV", "EPO(1)", "PiecewiseMSC(seg=3)"]:
-        for n_pls in [2, 4, 6, 8, 10]:
+        for n_pls in [2, 4, 6, 8]:
             configs.append({
                 "preprocess": prep,
                 "n_pls": n_pls,
-                "hidden_layers": (100, 50),
+                "hidden_layers": (50, 25),
                 "activation": "relu",
                 "alpha": 0.01,
-                "lr_init": 0.001,
+                "lr_init": 0.01,
                 "target_transform": "log1p",
             })
 
@@ -217,10 +217,10 @@ def build_experiment_configs():
         configs.append({
             "preprocess": "SNV+AsLS(1e6)",
             "n_pls": n_pls,
-            "hidden_layers": (100, 50),
+            "hidden_layers": (50, 25),
             "activation": "relu",
             "alpha": 0.01,
-            "lr_init": 0.001,
+            "lr_init": 0.01,
             "target_transform": "log1p",
         })
 
@@ -233,7 +233,7 @@ def build_experiment_configs():
                 "hidden_layers": hidden,
                 "activation": act,
                 "alpha": 0.01,
-                "lr_init": 0.001,
+                "lr_init": 0.01,
                 "target_transform": "log1p",
             })
 
@@ -243,28 +243,28 @@ def build_experiment_configs():
             configs.append({
                 "preprocess": "SNV",
                 "n_pls": 6,
-                "hidden_layers": (100, 50),
+                "hidden_layers": (50, 25),
                 "activation": "relu",
                 "alpha": alpha,
                 "lr_init": lr,
                 "target_transform": "log1p",
             })
 
-    # --- グループ4: 目的変数変換の比較（各前処理×各変換） ---
+    # --- グループ4: 目的変数変換の比較 ---
     for prep in ["SNV", "EPO(1)", "PiecewiseMSC(seg=3)"]:
         for tt in ["raw", "sqrt", "log1p"]:
             configs.append({
                 "preprocess": prep,
                 "n_pls": 6,
-                "hidden_layers": (100, 50),
+                "hidden_layers": (50, 25),
                 "activation": "relu",
                 "alpha": 0.01,
-                "lr_init": 0.001,
+                "lr_init": 0.01,
                 "target_transform": tt,
             })
 
     # --- グループ5: EPO(1)での構造・正則化スイープ ---
-    for hidden in [(50,), (100, 50), (100, 50, 25)]:
+    for hidden in [(50,), (50, 25), (100, 50)]:
         for alpha in [0.01, 0.1]:
             configs.append({
                 "preprocess": "EPO(1)",
@@ -272,7 +272,7 @@ def build_experiment_configs():
                 "hidden_layers": hidden,
                 "activation": "relu",
                 "alpha": alpha,
-                "lr_init": 0.001,
+                "lr_init": 0.01,
                 "target_transform": "log1p",
             })
 
@@ -285,7 +285,7 @@ def build_experiment_configs():
                 "hidden_layers": (50, 25),
                 "activation": "tanh",
                 "alpha": alpha,
-                "lr_init": 0.001,
+                "lr_init": 0.01,
                 "target_transform": "log1p",
             })
 
