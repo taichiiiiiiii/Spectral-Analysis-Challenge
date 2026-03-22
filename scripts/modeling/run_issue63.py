@@ -40,11 +40,11 @@ def main():
     for sp, cnt in sorted(zip(unique_sp, sp_counts), key=lambda x: -x[1]):
         print(f"  {sp}: {cnt}")
 
-    # 実験パラメータ（実行時間を抑えるためPLS成分数を絞る）
+    # 実験パラメータ（実行時間を抑えるためPLS成分数・試行回数を絞る）
     preprocessings = ["SNV", "EPO(1)", "SNV+AsLS(1e6)", "PiecewiseMSC(seg=3)"]
     model_types = ["lgb", "xgb", "svr"]
-    pls_components_list = [3, 5, 10]
-    n_trials = 15
+    pls_components_list = [5, 10]
+    n_trials = 10
 
     output_dir = Path(__file__).resolve().parents[2] / "outputs" / "modeling"
     output_dir.mkdir(parents=True, exist_ok=True)
