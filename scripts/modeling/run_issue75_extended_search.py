@@ -90,11 +90,17 @@ def predict_fold(X_tr_raw, X_te_raw, y_train, groups_train, cfg):
         nc = min(nc, X_tr.shape[1] - 1)
         m = PLSRegression(n_components=max(1, nc))
         if weights is not None:
-            sqrt_w = np.sqrt(weights)
-            m.fit(X_tr * sqrt_w[:, None], y_fit * sqrt_w)
+            # PLSはsample_weightをサポートしないため、
+            # PLS潜在変数を抽出した後にRidgeで重み付き回帰を行う
+            m.fit(X_tr, y_fit)
+            X_tr_scores = m.transform(X_tr)
+            X_te_scores = m.transform(X_te)
+            ridge = Ridge(alpha=1.0)
+            ridge.fit(X_tr_scores, y_fit, sample_weight=weights)
+            pred = ridge.predict(X_te_scores).ravel()
         else:
             m.fit(X_tr, y_fit)
-        pred = m.predict(X_te).ravel()
+            pred = m.predict(X_te).ravel()
     elif mdl == "Lasso":
         m = Lasso(alpha=0.1, max_iter=10000)
         m.fit(X_tr, y_fit, sample_weight=weights) if weights is not None else m.fit(X_tr, y_fit)
@@ -200,6 +206,7 @@ def main():
                 fp.append(p)
                 fr.append(rmse(y[te], p))
             except Exception as e:
+                print(f"    [ERROR] {cfg['name']} fold {f}: {e}")
                 fp.append(np.full(len(te), y[tr].mean()))
                 fr.append(999.0)
         all_preds.append(fp)
@@ -293,12 +300,18 @@ def main():
         _, _, fr = eval_ens(all_preds, y, folds, best[3], best[4])
     else:
         _, _, fr = eval_ens(all_preds, y, folds, best[3])
+    # ベイスギ除外RMSE計算
+    beisugi_idx = [i for i, sp in enumerate(sp_names) if sp == "ベイスギ"]
+    non_beisugi_fr = [r for i, r in enumerate(fr) if i not in beisugi_idx]
+
     print("=" * 70)
     print(f"BEST: {best[1]:.4f} ({best[0]})")
     print(f"v5: 15.28 | 改善: {15.28 - best[1]:.4f}")
+    print(f"ベイスギ除外RMSE: {np.mean(non_beisugi_fr):.4f}")
     print("Fold詳細:")
     for sp, r in zip(sp_names, fr):
-        print(f"  {sp}: {r:.2f}")
+        tag = " ※参考値" if sp == "ベイスギ" else ""
+        print(f"  {sp}: {r:.2f}{tag}")
     print("=" * 70)
 
     rows = [{"method": nm, "rmse": r, "models": str([names[i] for i in idx])} for nm, r, _, idx, _ in results]
