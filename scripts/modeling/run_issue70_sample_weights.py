@@ -94,62 +94,6 @@ def preprocess(X_train, X_val, groups_train):
     return X_tr, X_va
 
 
-def run_loso_cv(X, y, groups, model_name, model_params, weight_strategy, target_transform):
-    """LOSO-CVを実行し、fold-RMSEの平均を返す。"""
-    logo = LeaveOneGroupOut()
-    fold_rmses = []
-
-    for train_idx, val_idx in logo.split(X, y, groups):
-        X_train, X_val = X[train_idx], X[val_idx]
-        y_train, y_val = y[train_idx], y[val_idx]
-        groups_train = groups[train_idx]
-
-        # 前処理
-        X_tr, X_va = preprocess(X_train, X_val, groups_train)
-
-        # 目的変数変換
-        if target_transform == "sqrt":
-            y_tr = np.sqrt(y_train)
-        else:
-            y_tr = y_train.copy()
-
-        # 重み計算（訓練foldのみから）
-        weights = compute_sample_weights(groups_train, weight_strategy)
-
-        # モデル学習・予測
-        if model_name.startswith("PLS"):
-            n_comp = model_params["n_components"]
-            model = PLSRegression(n_components=n_comp, scale=False)
-            # PLSはsample_weightをサポートしないため、sqrt(w)でX,yを重み付け
-            sqrt_w = np.sqrt(weights)
-            X_tr_w = X_tr * sqrt_w[:, None]
-            y_tr_w = y_tr * sqrt_w
-            model.fit(X_tr_w, y_tr_w)
-            # 予測時は重みなし
-            pred = model.predict(X_va).ravel()
-        else:
-            if model_name == "Lasso":
-                model = Lasso(alpha=model_params["alpha"], max_iter=2000, tol=1e-3)
-            elif model_name == "Ridge":
-                model = Ridge(alpha=model_params["alpha"])
-            elif model_name == "ElasticNet":
-                model = ElasticNet(alpha=model_params["alpha"], max_iter=2000, tol=1e-3)
-            else:
-                raise ValueError(f"Unknown model: {model_name}")
-            model.fit(X_tr, y_tr, sample_weight=weights)
-            pred = model.predict(X_va).ravel()
-
-        # 逆変換
-        if target_transform == "sqrt":
-            pred = pred ** 2
-
-        pred = np.clip(pred, 0, None)
-        rmse = np.sqrt(np.mean((y_val - pred) ** 2))
-        fold_rmses.append(rmse)
-
-    return np.mean(fold_rmses)
-
-
 def main():
     print("=" * 70)
     print("Issue #70: サンプル重み付け戦略のLOSO-CV評価")
@@ -173,7 +117,7 @@ def main():
 
     # 実験設定
     weight_strategies = ["no_weight", "inv_freq", "sqrt_inv", "log_inv"]
-    models = [
+    models_config = [
         ("PLS", {"n_components": 2}),
         ("PLS", {"n_components": 4}),
         ("Lasso", {"alpha": 0.1}),
@@ -182,36 +126,109 @@ def main():
     ]
     target_transforms = ["raw", "sqrt"]
 
-    results = []
-    total = len(weight_strategies) * len(models) * len(target_transforms)
-    count = 0
-
+    total = len(weight_strategies) * len(models_config) * len(target_transforms)
     print(f"\n実験数: {total}")
+    print("前処理をfoldごとに1回のみ実行（高速化）")
     print("-" * 70)
 
     start_all = time.time()
 
+    # LOSO-CVのfold分割を事前に取得
+    logo = LeaveOneGroupOut()
+    folds = list(logo.split(X, y, groups))
+
+    # 各foldで前処理を事前計算（重み付けに依存しない）
+    print("\n前処理を13 foldで事前計算中...")
+    t_pre = time.time()
+    preprocessed_folds = []
+    for fold_idx, (train_idx, val_idx) in enumerate(folds):
+        X_train, X_val = X[train_idx], X[val_idx]
+        groups_train = groups[train_idx]
+        X_tr, X_va = preprocess(X_train, X_val, groups_train)
+        preprocessed_folds.append({
+            "train_idx": train_idx,
+            "val_idx": val_idx,
+            "X_tr": X_tr,
+            "X_va": X_va,
+            "groups_train": groups_train,
+        })
+        species_left_out = np.unique(groups[val_idx])[0]
+        print(f"  fold {fold_idx+1:2d}: {species_left_out} (train={len(train_idx)}, val={len(val_idx)})")
+    print(f"前処理完了: {time.time() - t_pre:.1f}s\n")
+
+    # 全組合せを実行
+    results = []
+    count = 0
+
     for target_tf in target_transforms:
-        for model_name, model_params in models:
+        for model_name, model_params in models_config:
             for ws in weight_strategies:
                 count += 1
                 param_str = ", ".join(f"{k}={v}" for k, v in model_params.items())
                 label = f"{model_name}({param_str})"
 
                 t0 = time.time()
-                rmse = run_loso_cv(X, y, groups, model_name, model_params, ws, target_tf)
+                fold_rmses = []
+
+                for fold_data in preprocessed_folds:
+                    train_idx = fold_data["train_idx"]
+                    val_idx = fold_data["val_idx"]
+                    X_tr = fold_data["X_tr"]
+                    X_va = fold_data["X_va"]
+                    groups_train = fold_data["groups_train"]
+
+                    y_train = y[train_idx]
+                    y_val = y[val_idx]
+
+                    # 目的変数変換
+                    if target_tf == "sqrt":
+                        y_tr = np.sqrt(y_train)
+                    else:
+                        y_tr = y_train.copy()
+
+                    # 重み計算（訓練foldのみから）
+                    weights = compute_sample_weights(groups_train, ws)
+
+                    # モデル学習・予測
+                    if model_name.startswith("PLS"):
+                        n_comp = model_params["n_components"]
+                        model = PLSRegression(n_components=n_comp, scale=False)
+                        sqrt_w = np.sqrt(weights)
+                        X_tr_w = X_tr * sqrt_w[:, None]
+                        y_tr_w = y_tr * sqrt_w
+                        model.fit(X_tr_w, y_tr_w)
+                        pred = model.predict(X_va).ravel()
+                    else:
+                        if model_name == "Lasso":
+                            model = Lasso(alpha=model_params["alpha"], max_iter=2000, tol=1e-3)
+                        elif model_name == "Ridge":
+                            model = Ridge(alpha=model_params["alpha"])
+                        elif model_name == "ElasticNet":
+                            model = ElasticNet(alpha=model_params["alpha"], max_iter=2000, tol=1e-3)
+                        model.fit(X_tr, y_tr, sample_weight=weights)
+                        pred = model.predict(X_va).ravel()
+
+                    # 逆変換
+                    if target_tf == "sqrt":
+                        pred = pred ** 2
+
+                    pred = np.clip(pred, 0, None)
+                    rmse = np.sqrt(np.mean((y_val - pred) ** 2))
+                    fold_rmses.append(rmse)
+
+                mean_rmse = np.mean(fold_rmses)
                 elapsed = time.time() - t0
 
                 results.append({
                     "model": label,
                     "weight_strategy": ws,
                     "target_transform": target_tf,
-                    "fold_rmse_mean": round(rmse, 4),
+                    "fold_rmse_mean": round(mean_rmse, 4),
                     "time_sec": round(elapsed, 1),
                 })
 
                 print(f"  [{count:2d}/{total}] {label:30s} | weight={ws:12s} | "
-                      f"target={target_tf:4s} | RMSE={rmse:7.4f} | {elapsed:.1f}s")
+                      f"target={target_tf:4s} | RMSE={mean_rmse:7.4f} | {elapsed:.1f}s")
 
     elapsed_all = time.time() - start_all
     print(f"\n総実行時間: {elapsed_all:.1f}s")
@@ -233,7 +250,7 @@ def main():
 
     for target_tf in target_transforms:
         print(f"\n--- target_transform = {target_tf} ---")
-        for model_name, model_params in models:
+        for model_name, model_params in models_config:
             param_str = ", ".join(f"{k}={v}" for k, v in model_params.items())
             label = f"{model_name}({param_str})"
 
