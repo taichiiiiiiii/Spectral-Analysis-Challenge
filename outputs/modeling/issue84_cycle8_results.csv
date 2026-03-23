@@ -1,0 +1,7 @@
+method,rmse,models
+Cycle7-Base,14.217317503620443,"['M1:EPO+PLS4+sqrt', 'M3:SNV+iPLS50+PLS4+sqrt', 'M5:SNV+AsLS+siPLS+PLS5+sqrt', 'C1:SNV+iPLS50+PLS5+sqrt', 'N10:PMSC+siPLS+GBR+sqrt', 'G9:SG2d+EPO+GBR+raw', 'N2:SNV+SG2d+GBR+raw', 'Gnew1:EPO+GBR150_008+raw']"
+BestCombo9-W,14.345750681066242,"['M5:SNV+AsLS+siPLS+PLS5+sqrt', 'H2:SNV+iPLS50+PLS4+Huber+sqrt', 'C1:SNV+iPLS50+PLS5+sqrt', 'N10:PMSC+siPLS+GBR+sqrt', 'MB1:multi_SNV_EPO+PLS4+sqrt', 'E1:EPO+PLS4poly+ENet+sqrt', 'M1:EPO+PLS4+sqrt', 'G9:SG2d+EPO+GBR+raw', 'P3:SG2d+EPO+PLS4poly+GBR+raw']"
+BestCombo10-W,14.346769125353664,"['M5:SNV+AsLS+siPLS+PLS5+sqrt', 'H2:SNV+iPLS50+PLS4+Huber+sqrt', 'C1:SNV+iPLS50+PLS5+sqrt', 'M3:SNV+iPLS50+PLS4+sqrt', 'N10:PMSC+siPLS+GBR+sqrt', 'MB1:multi_SNV_EPO+PLS4+sqrt', 'E1:EPO+PLS4poly+ENet+sqrt', 'M1:EPO+PLS4+sqrt', 'G9:SG2d+EPO+GBR+raw', 'P3:SG2d+EPO+PLS4poly+GBR+raw']"
+BestCombo7-W,14.385405523873201,"['M5:SNV+AsLS+siPLS+PLS5+sqrt', 'H2:SNV+iPLS50+PLS4+Huber+sqrt', 'C1:SNV+iPLS50+PLS5+sqrt', 'N10:PMSC+siPLS+GBR+sqrt', 'E1:EPO+PLS4poly+ENet+sqrt', 'M1:EPO+PLS4+sqrt', 'G9:SG2d+EPO+GBR+raw']"
+BestCombo8-W,14.385407849910592,"['M5:SNV+AsLS+siPLS+PLS5+sqrt', 'H2:SNV+iPLS50+PLS4+Huber+sqrt', 'C1:SNV+iPLS50+PLS5+sqrt', 'M3:SNV+iPLS50+PLS4+sqrt', 'N10:PMSC+siPLS+GBR+sqrt', 'E1:EPO+PLS4poly+ENet+sqrt', 'M1:EPO+PLS4+sqrt', 'G9:SG2d+EPO+GBR+raw']"
+BestCombo6-W,14.409684495804822,"['M5:SNV+AsLS+siPLS+PLS5+sqrt', 'H2:SNV+iPLS50+PLS4+Huber+sqrt', 'N10:PMSC+siPLS+GBR+sqrt', 'MB1:multi_SNV_EPO+PLS4+sqrt', 'E1:EPO+PLS4poly+ENet+sqrt', 'G9:SG2d+EPO+GBR+raw']"
