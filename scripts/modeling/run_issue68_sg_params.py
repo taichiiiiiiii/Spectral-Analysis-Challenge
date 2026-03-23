@@ -52,7 +52,7 @@ def main():
     for deriv in [1, 2]:
         for wl in [5, 7, 9, 11, 13, 15]:
             for po in [2, 3]:
-                if po < wl and po >= deriv:  # polyorder < window_length かつ polyorder >= deriv
+                if po < wl and po >= deriv:
                     sg_params.append((deriv, wl, po))
 
     print(f"SG parameter combinations: {len(sg_params)}")
@@ -68,39 +68,45 @@ def main():
     print(f"Total combinations: {total_combos}")
     print("=" * 80)
 
-    # --- SG前処理をfold毎にキャッシュ ---
-    # キー: (deriv, wl, po, fold_idx) -> (X_train_sg, X_test_sg)
-    print("Pre-computing SG derivatives for all folds...")
-    sg_cache = {}
-    for sg_idx, (deriv, wl, po) in enumerate(sg_params):
-        for fold_idx, (train_idx, test_idx) in enumerate(folds):
-            X_train_sg = apply_savgol(X_raw[train_idx], deriv=deriv, window_length=wl, polyorder=po)
-            X_test_sg = apply_savgol(X_raw[test_idx], deriv=deriv, window_length=wl, polyorder=po)
-            sg_cache[(deriv, wl, po, fold_idx)] = (X_train_sg, X_test_sg)
+    # --- 全SG前処理をサンプル全体に一括適用してキャッシュ ---
+    print("Pre-computing SG derivatives (full dataset)...")
+    sg_full_cache = {}
+    for deriv, wl, po in sg_params:
+        sg_full_cache[(deriv, wl, po)] = apply_savgol(X_raw, deriv=deriv, window_length=wl, polyorder=po)
+    print(f"SG full cache built: {len(sg_full_cache)} entries ({time.time() - t0:.1f}s)")
 
-    print(f"SG cache built: {len(sg_cache)} entries ({time.time() - t0:.1f}s)")
-
-    # --- 実験実行 ---
+    # --- 実験実行: SGパラメータ毎にfoldをループ ---
     results = []
     combo_count = 0
 
-    for deriv, wl, po in sg_params:
+    for sg_idx, (deriv, wl, po) in enumerate(sg_params):
+        X_sg_all = sg_full_cache[(deriv, wl, po)]
+
+        # fold毎にEPO投影行列をキャッシュ（同じSGパラメータ内で再利用）
+        epo_cache = {}  # fold_idx -> P matrix
+
         for pipe_name, n_epo, n_pls, y_transform in pipelines:
             combo_count += 1
             fold_rmses = []
 
             for fold_idx, (train_idx, test_idx) in enumerate(folds):
-                X_train_sg, X_test_sg = sg_cache[(deriv, wl, po, fold_idx)]
+                X_train_sg = X_sg_all[train_idx]
+                X_test_sg = X_sg_all[test_idx]
 
                 # 目的変数変換
                 if y_transform == "sqrt":
                     y_train = np.sqrt(y[train_idx])
                 else:
-                    y_train = y[train_idx].copy()
+                    y_train = y[train_idx]
 
-                # EPO適用
+                # EPO適用（キャッシュ利用）
                 if n_epo is not None:
-                    P = compute_epo_projection(X_train_sg, groups[train_idx], n_components=n_epo)
+                    cache_key = (fold_idx, n_epo)
+                    if cache_key not in epo_cache:
+                        P = compute_epo_projection(X_train_sg, groups[train_idx], n_components=n_epo)
+                        epo_cache[cache_key] = P
+                    else:
+                        P = epo_cache[cache_key]
                     X_train_final = apply_epo(X_train_sg, P)
                     X_test_final = apply_epo(X_test_sg, P)
                 else:
@@ -131,7 +137,6 @@ def main():
                 "y_transform": y_transform,
                 "mean_rmse": mean_rmse,
                 "std_rmse": std_rmse,
-                "fold_rmses": fold_rmses,
             })
 
             if combo_count % 10 == 0 or combo_count == total_combos:
@@ -140,10 +145,7 @@ def main():
                       f"RMSE={mean_rmse:.4f} ± {std_rmse:.4f} ({elapsed:.1f}s)")
 
     # --- 結果集計 ---
-    df_results = pd.DataFrame([
-        {k: v for k, v in r.items() if k != "fold_rmses"}
-        for r in results
-    ])
+    df_results = pd.DataFrame(results)
     df_results = df_results.sort_values("mean_rmse").reset_index(drop=True)
 
     # CSV保存
