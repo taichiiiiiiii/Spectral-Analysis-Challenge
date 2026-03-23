@@ -216,16 +216,26 @@ def build_experiment_configs():
 
     # --- グループ2: MLP構造のスイープ（固定前処理: SNV, PLS=6） ---
     for hidden in [(50,), (100,), (50, 25), (100, 50), (100, 50, 25)]:
-        for act in ["relu", "tanh"]:
-            configs.append({
-                "preprocess": "SNV",
-                "n_pls": 6,
-                "hidden_layers": hidden,
-                "activation": act,
-                "alpha": 0.01,
-                "lr_init": 0.01,
-                "target_transform": "log1p",
-            })
+        configs.append({
+            "preprocess": "SNV",
+            "n_pls": 6,
+            "hidden_layers": hidden,
+            "activation": "tanh",
+            "alpha": 0.01,
+            "lr_init": 0.01,
+            "target_transform": "log1p",
+        })
+    # relu only for smaller networks (faster)
+    for hidden in [(50,), (50, 25)]:
+        configs.append({
+            "preprocess": "SNV",
+            "n_pls": 6,
+            "hidden_layers": hidden,
+            "activation": "relu",
+            "alpha": 0.01,
+            "lr_init": 0.01,
+            "target_transform": "log1p",
+        })
 
     # --- グループ3: 正則化強度のスイープ ---
     for alpha in [0.001, 0.01, 0.1, 1.0]:
@@ -254,13 +264,13 @@ def build_experiment_configs():
             })
 
     # --- グループ5: EPO(1)での構造・正則化スイープ ---
-    for hidden in [(50,), (50, 25), (100, 50)]:
+    for hidden in [(50,), (50, 25)]:
         for alpha in [0.01, 0.1]:
             configs.append({
                 "preprocess": "EPO(1)",
                 "n_pls": 6,
                 "hidden_layers": hidden,
-                "activation": "relu",
+                "activation": "tanh",
                 "alpha": alpha,
                 "lr_init": 0.01,
                 "target_transform": "log1p",
