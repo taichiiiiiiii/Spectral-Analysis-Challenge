@@ -144,7 +144,7 @@ def predict_fold_bias_corrected(X_tr_raw, X_te_raw, y_train, groups_train, cfg):
     X_tr, X_te = preprocess(X_tr_raw, X_te_raw, groups_train, pp)
     X_tr, X_te = feature_select(X_tr, X_te, y_train, fs)
 
-    nc = min(nc, X_tr.shape[1] - 1, max(1, nc))
+    nc = max(1, min(nc, X_tr.shape[1] - 1))
     if tf == "sqrt":
         y_fit = np.sqrt(y_train)
     else:
@@ -153,24 +153,19 @@ def predict_fold_bias_corrected(X_tr_raw, X_te_raw, y_train, groups_train, cfg):
     pls = PLSRegression(n_components=nc)
     pls.fit(X_tr, y_fit)
 
-    # trainのPLSスコア
+    # 標準予測
+    pred_standard = pls.predict(X_te).ravel()
+
+    # PLSスコア空間でのバイアス推定
     T_train = pls.transform(X_tr)
     T_test = pls.transform(X_te)
-
-    # テストPLSスコアの平均とtrainの平均のオフセット
     score_offset = T_test.mean(axis=0) - T_train.mean(axis=0)
 
-    # テストスコアを補正（trainの分布に近づける）
-    T_test_corrected = T_test - score_offset
-
-    # 補正後のスコアで予測（回帰係数を直接適用）
-    pred_corrected = T_test_corrected @ pls.y_loadings_.T
-    pred_corrected = pred_corrected.ravel()
-
-    # 平均を加える（PLSは中心化しているため）
-    y_mean = np.mean(y_fit)
-    X_mean_score = T_train.mean(axis=0)
-    pred_corrected = pred_corrected + y_mean
+    # スコアオフセットをY空間に変換してバイアス補正
+    offset_y = (score_offset @ pls.y_loadings_.T).ravel()
+    if hasattr(pls, '_y_std'):
+        offset_y = offset_y * pls._y_std.ravel()
+    pred_corrected = pred_standard - offset_y
 
     if tf == "sqrt":
         pred_corrected = np.clip(pred_corrected, 0, None) ** 2

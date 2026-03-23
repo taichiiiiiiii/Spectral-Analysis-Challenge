@@ -82,7 +82,7 @@ def feature_select(X_tr, X_te, y_train, fs):
 
 
 def get_pls_scores(X_tr, X_te, y_train, nc, tf):
-    nc = min(nc, X_tr.shape[1] - 1, max(1, nc))
+    nc = max(1, min(nc, X_tr.shape[1] - 1))
     y_fit = np.sqrt(y_train) if tf == "sqrt" else y_train.copy()
     pls = PLSRegression(n_components=nc)
     pls.fit(X_tr, y_fit)

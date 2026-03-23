@@ -180,7 +180,7 @@ def main():
     for s,r in zip(sp,fr): print(f"  {s}: {r:.2f}{' ※' if s=='ベイスギ' else ''}")
     nbs=[r for s,r in zip(sp,fr) if s!="ベイスギ"]; print(f"  除ベイスギ: {np.mean(nbs):.4f}")
 
-    rows=[{"method":n,"rmse":r,"models":str([cfgs[i]["name"] for i in c])} for n,r,c,w in res]
+    rows=[{"method":nm,"rmse":r,"models":str([cfgs[i]["name"] for i in c])} for nm,r,c,w in res]
     pd.DataFrame(rows).to_csv(OUT_DIR/"issue88_cycle11_results.csv",index=False)
     print(f"\n保存. 時間: {time.time()-t0:.0f}s")
 
