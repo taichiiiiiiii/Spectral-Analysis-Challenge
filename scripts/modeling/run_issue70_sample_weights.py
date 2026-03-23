@@ -202,7 +202,7 @@ def main():
                         if model_name == "Lasso":
                             model = Lasso(alpha=model_params["alpha"], max_iter=2000, tol=1e-3)
                         elif model_name == "Ridge":
-                            model = Ridge(alpha=model_params["alpha"])
+                            model = Ridge(alpha=model_params["alpha"], solver="cholesky")
                         elif model_name == "ElasticNet":
                             model = ElasticNet(alpha=model_params["alpha"], max_iter=2000, tol=1e-3)
                         model.fit(X_tr, y_tr, sample_weight=weights)
@@ -228,7 +228,8 @@ def main():
                 })
 
                 print(f"  [{count:2d}/{total}] {label:30s} | weight={ws:12s} | "
-                      f"target={target_tf:4s} | RMSE={mean_rmse:7.4f} | {elapsed:.1f}s")
+                      f"target={target_tf:4s} | RMSE={mean_rmse:7.4f} | {elapsed:.1f}s",
+                      flush=True)
 
     elapsed_all = time.time() - start_all
     print(f"\n総実行時間: {elapsed_all:.1f}s")
