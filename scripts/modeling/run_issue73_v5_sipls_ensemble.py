@@ -63,7 +63,7 @@ def predict_fold(X_tr_raw, X_te_raw, y_train, groups_train, config):
     # Feature selection
     fs = config.get("fs")
     if fs == "VIP(1.5)":
-        X_tr, X_te = vip_select(X_tr, y_train, X_te, threshold=1.5)
+        X_tr, X_te, _ = vip_select(X_tr, y_train, X_te, threshold=1.5)
     elif fs == "siPLS(30,3)":
         X_tr, X_te, _ = sipls_select(X_tr, y_train, X_te, n_intervals=30, n_components=3, n_combine=3)
     elif fs == "siPLS(20,3)":
@@ -103,7 +103,7 @@ def eval_ensemble(all_preds, y, folds, idx, weights=None):
     fold_rmses = []
     for f, (_, te) in enumerate(folds):
         preds = [all_preds[i][f] for i in idx]
-        ens = sum(w * p for w, p in zip(weights, preds)) if weights else np.mean(preds, axis=0)
+        ens = sum(w * p for w, p in zip(weights, preds)) if weights is not None else np.mean(preds, axis=0)
         fold_rmses.append(rmse(y[te], np.clip(ens, 0, 200)))
     return np.mean(fold_rmses), np.std(fold_rmses), fold_rmses
 
