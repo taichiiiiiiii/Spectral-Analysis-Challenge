@@ -129,11 +129,11 @@ def run_loso_cv(X, y, groups, model_name, model_params, weight_strategy, target_
             pred = model.predict(X_va).ravel()
         else:
             if model_name == "Lasso":
-                model = Lasso(alpha=model_params["alpha"], max_iter=10000)
+                model = Lasso(alpha=model_params["alpha"], max_iter=2000, tol=1e-3)
             elif model_name == "Ridge":
                 model = Ridge(alpha=model_params["alpha"])
             elif model_name == "ElasticNet":
-                model = ElasticNet(alpha=model_params["alpha"], max_iter=10000)
+                model = ElasticNet(alpha=model_params["alpha"], max_iter=2000, tol=1e-3)
             else:
                 raise ValueError(f"Unknown model: {model_name}")
             model.fit(X_tr, y_tr, sample_weight=weights)

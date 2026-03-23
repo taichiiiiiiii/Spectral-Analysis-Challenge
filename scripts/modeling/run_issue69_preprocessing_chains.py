@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import numpy as np
 import pandas as pd
 import time
-import signal
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -33,43 +32,19 @@ OUT_DIR = Path(__file__).resolve().parents[2] / "outputs" / "modeling"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# === Timeout helper ===
-class TimeoutError(Exception):
-    pass
-
-def _timeout_handler(signum, frame):
-    raise TimeoutError("Preprocessing timed out")
-
-
-def run_with_timeout(func, timeout_sec=30):
-    """Run func with a timeout. Returns result or raises TimeoutError."""
-    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(timeout_sec)
-    try:
-        result = func()
-        signal.alarm(0)
-        return result
-    except TimeoutError:
-        raise
-    finally:
-        signal.signal(signal.SIGALRM, old_handler)
-        signal.alarm(0)
-
-
 # === Preprocessing step functions ===
-# Each returns (X_train_out, X_test_out) given (X_train_raw, X_test_raw, groups_train)
-# "raw" inputs to these are the output of the previous stage.
+# Each: (X_train, X_test, groups_train) -> (X_train_out, X_test_out)
 
 def step_snv(X_train, X_test, groups_train):
     return apply_snv(X_train), apply_snv(X_test)
 
 def step_sg1d_w11(X_train, X_test, groups_train):
-    return apply_savgol(X_train, deriv=1, window_length=11, polyorder=2), \
-           apply_savgol(X_test, deriv=1, window_length=11, polyorder=2)
+    return (apply_savgol(X_train, deriv=1, window_length=11, polyorder=2),
+            apply_savgol(X_test, deriv=1, window_length=11, polyorder=2))
 
 def step_sg2d_w7(X_train, X_test, groups_train):
-    return apply_savgol(X_train, deriv=2, window_length=7, polyorder=2), \
-           apply_savgol(X_test, deriv=2, window_length=7, polyorder=2)
+    return (apply_savgol(X_train, deriv=2, window_length=7, polyorder=2),
+            apply_savgol(X_test, deriv=2, window_length=7, polyorder=2))
 
 def step_msc(X_train, X_test, groups_train):
     ref = compute_msc_reference(X_train)
@@ -87,6 +62,7 @@ def step_whittaker_1e3(X_train, X_test, groups_train):
 
 
 # === Chain definitions ===
+# (name, [step_functions], is_slow)
 CHAINS = [
     ("SNV->SG1d(w=11)",      [step_snv, step_sg1d_w11],      False),
     ("SNV->SG2d(w=7)",       [step_snv, step_sg2d_w7],       False),
@@ -96,8 +72,8 @@ CHAINS = [
     ("MSC->EPO(1)",           [step_msc, step_epo1],          False),
     ("SG1d(w=11)->EPO(1)",    [step_sg1d_w11, step_epo1],    False),
     ("EPO(1)->SNV",           [step_epo1, step_snv],          False),
-    ("EPO(1)->AsLS(1e6)",     [step_epo1, step_asls_1e6],    True),   # slow
-    ("SNV->Whittaker(1e3)",   [step_snv, step_whittaker_1e3], True),   # slow
+    ("EPO(1)->AsLS(1e6)",     [step_epo1, step_asls_1e6],    True),
+    ("SNV->Whittaker(1e3)",   [step_snv, step_whittaker_1e3], True),
 ]
 
 # === Model definitions ===
@@ -110,17 +86,49 @@ MODELS = [
 ]
 
 
-def apply_chain_fold(steps, X_train_raw, X_test_raw, groups_train, timeout=30):
-    """Apply a chain of preprocessing steps for one fold.
-
-    Returns (X_train_processed, X_test_processed) or raises TimeoutError.
-    """
+def apply_chain_fold(steps, X_train_raw, X_test_raw, groups_train):
+    """Apply a chain of preprocessing steps for one fold."""
     X_tr, X_te = X_train_raw.copy(), X_test_raw.copy()
     for step_fn in steps:
-        def _run(s=step_fn, xtr=X_tr, xte=X_te, gt=groups_train):
-            return s(xtr, xte, gt)
-        X_tr, X_te = run_with_timeout(_run, timeout_sec=timeout)
+        X_tr, X_te = step_fn(X_tr, X_te, groups_train)
     return X_tr, X_te
+
+
+def preprocess_all_folds(chain_name, steps, folds, X_raw, groups, is_slow, timeout_sec=30):
+    """Preprocess all folds for a chain. Returns dict of fold_data or None if timed out."""
+    fold_data = {}
+    chain_t0 = time.time()
+
+    for fold_idx, (train_idx, test_idx) in enumerate(folds):
+        # For slow chains, check elapsed time before each fold
+        if is_slow and fold_idx > 0:
+            elapsed = time.time() - chain_t0
+            avg_per_fold = elapsed / fold_idx
+            if avg_per_fold > timeout_sec / len(folds):
+                # Extrapolate: will exceed timeout
+                est_total = avg_per_fold * len(folds)
+                if est_total > timeout_sec * 2:
+                    print(f"  [SKIP] fold {fold_idx}: 推定所要時間 {est_total:.0f}s > タイムアウト {timeout_sec}s")
+                    return None
+
+        fold_t0 = time.time()
+        try:
+            X_tr_pp, X_te_pp = apply_chain_fold(
+                steps, X_raw[train_idx], X_raw[test_idx], groups[train_idx]
+            )
+            fold_data[fold_idx] = (X_tr_pp, X_te_pp, train_idx, test_idx)
+            fold_time = time.time() - fold_t0
+
+            # For slow chains, skip immediately if first fold is too slow
+            if is_slow and fold_idx == 0 and fold_time > timeout_sec / 2:
+                print(f"  [SKIP] fold 0 took {fold_time:.1f}s - chain too slow")
+                return None
+
+        except Exception as e:
+            print(f"  [SKIP] fold {fold_idx} エラー: {e}")
+            return None
+
+    return fold_data
 
 
 def main():
@@ -145,44 +153,25 @@ def main():
 
     results = []
 
-    # Cache: chain_name -> fold_idx -> (X_train_pp, X_test_pp)
-    fold_cache = {}
-
     for chain_name, steps, is_slow in CHAINS:
-        print(f"--- 前処理チェーン: {chain_name} ---")
+        print(f"--- 前処理チェーン: {chain_name} {'[slow]' if is_slow else ''} ---")
         chain_t0 = time.time()
 
-        # Preprocess all folds (with caching)
-        fold_data = {}
-        skipped = False
+        # Preprocess all folds
+        fold_data = preprocess_all_folds(
+            chain_name, steps, folds, X_raw, groups,
+            is_slow=is_slow, timeout_sec=30
+        )
 
-        for fold_idx, (train_idx, test_idx) in enumerate(folds):
-            try:
-                timeout = 30 if is_slow else 120
-                X_tr_pp, X_te_pp = apply_chain_fold(
-                    steps,
-                    X_raw[train_idx], X_raw[test_idx],
-                    groups[train_idx],
-                    timeout=timeout,
-                )
-                fold_data[fold_idx] = (X_tr_pp, X_te_pp, train_idx, test_idx)
-            except (TimeoutError, Exception) as e:
-                print(f"  [SKIP] fold {fold_idx} タイムアウトまたはエラー: {e}")
-                skipped = True
-                break
-
-        if skipped:
-            print(f"  => チェーン {chain_name} をスキップ（{time.time()-chain_t0:.1f}s）")
+        if fold_data is None:
+            print(f"  => チェーン {chain_name} をスキップ")
             print()
             continue
 
-        chain_pp_time = time.time() - chain_t0
-        print(f"  前処理完了: {chain_pp_time:.1f}s")
+        pp_time = time.time() - chain_t0
+        print(f"  前処理完了: {pp_time:.1f}s ({n_folds}フォールド)")
 
-        # Cache for this chain
-        fold_cache[chain_name] = fold_data
-
-        # Evaluate each model
+        # Evaluate each model using cached preprocessing
         for model_name, model_factory, y_transform, y_inverse in MODELS:
             fold_rmses = []
 
@@ -192,16 +181,12 @@ def main():
                 y_test = y[test_idx]
 
                 # Transform target if needed
-                if y_transform is not None:
-                    y_train_t = y_transform(y_train)
-                else:
-                    y_train_t = y_train
+                y_train_t = y_transform(y_train) if y_transform is not None else y_train
 
-                # Fit model
+                # Fit & predict
                 model = model_factory()
                 try:
                     model.fit(X_tr_pp, y_train_t)
-                    pred = model.predict(X_tr_pp[:0])  # just to check shape
                     pred = model.predict(X_te_pp)
                     if hasattr(pred, 'ravel'):
                         pred = pred.ravel()
@@ -216,7 +201,7 @@ def main():
                     fold_rmse = float(np.sqrt(np.mean((pred - y_test) ** 2)))
                     fold_rmses.append(fold_rmse)
                 except Exception as e:
-                    print(f"  [WARN] {model_name} fold {fold_idx} エラー: {e}")
+                    print(f"  [WARN] {model_name} fold {fold_idx}: {e}")
                     fold_rmses.append(np.nan)
 
             mean_rmse = float(np.nanmean(fold_rmses))
@@ -227,7 +212,7 @@ def main():
                 "model": model_name,
                 "rmse_mean": round(mean_rmse, 4),
                 "rmse_std": round(std_rmse, 4),
-                "n_folds": sum(~np.isnan(fold_rmses)),
+                "n_folds": int(np.sum(~np.isnan(fold_rmses))),
             })
             print(f"  {model_name}: RMSE={mean_rmse:.4f} (std={std_rmse:.4f})")
 
