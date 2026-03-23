@@ -152,15 +152,14 @@ def run_single_config(
                 hidden_layer_sizes=hidden_layers,
                 activation=activation,
                 solver="adam",
-                alpha=alpha,
-                learning_rate="adaptive",
+                learning_rate="constant",
                 learning_rate_init=learning_rate_init,
-                max_iter=500,
+                alpha=alpha,
+                max_iter=300,
                 early_stopping=True,
                 validation_fraction=0.15,
                 random_state=random_state,
                 n_iter_no_change=10,
-                batch_size=min(200, max(len(y_train_t) // 5, 32)),
             )
             mlp.fit(T_train_s, y_train_t)
 
