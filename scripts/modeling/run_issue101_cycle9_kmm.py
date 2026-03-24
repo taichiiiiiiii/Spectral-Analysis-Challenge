@@ -34,11 +34,45 @@ OUT_DIR = Path(__file__).resolve().parents[2] / "outputs" / "modeling"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def compute_kmm_weights_fast(X_source, X_target, gamma=None, B=10.0, eps=0.1):
-    """高速KMM: L-BFGS-B + projection clipping で近似的に解く。
+def compute_kmm_weights_fast(X_source, X_target, gamma=None, B=10.0, max_source=300):
+    """高速KMM: サブサンプリング + L-BFGS-B。
 
-    SLSQP版より大幅に高速（制約をbound clippingで近似）。
+    大規模データではソースをサブサンプリングしてKMMを解き、
+    残りのサンプルにはk-NN補間で重みを割り当てる。
     """
+    n_s = len(X_source)
+    n_t = len(X_target)
+
+    # サブサンプリング不要な場合
+    if n_s <= max_source:
+        return _compute_kmm_core(X_source, X_target, gamma, B)
+
+    # サブサンプリング: ランダムにmax_source個選択
+    rng = np.random.RandomState(42)
+    sub_idx = rng.choice(n_s, max_source, replace=False)
+    X_sub = X_source[sub_idx]
+
+    w_sub = _compute_kmm_core(X_sub, X_target, gamma, B)
+
+    # 全サンプルへの重み補間: 最近傍のサブサンプル重みを使用
+    from sklearn.neighbors import NearestNeighbors
+    nn = NearestNeighbors(n_neighbors=min(5, max_source))
+    nn.fit(X_sub)
+    dists, indices = nn.kneighbors(X_source)
+    # 距離の逆数で重み付き平均
+    inv_dists = 1.0 / (dists + 1e-10)
+    inv_dists_norm = inv_dists / inv_dists.sum(axis=1, keepdims=True)
+    weights = (inv_dists_norm * w_sub[indices]).sum(axis=1)
+    weights = np.clip(weights, 0, B)
+    # スケーリング: sum(w) ≈ n_s
+    w_sum = weights.sum()
+    if w_sum > 0:
+        weights = weights * (n_s / w_sum)
+    return np.clip(weights, 0, B)
+
+
+def _compute_kmm_core(X_source, X_target, gamma=None, B=10.0):
+    """コアKMM解法: L-BFGS-B"""
     n_s = len(X_source)
     n_t = len(X_target)
 
@@ -49,7 +83,7 @@ def compute_kmm_weights_fast(X_source, X_target, gamma=None, B=10.0, eps=0.1):
     K_ss = rbf_kernel(X_source, X_source, gamma=gamma)
     K_st = rbf_kernel(X_source, X_target, gamma=gamma)
     kappa = K_st.mean(axis=1) * (n_s / n_t)
-    K_ss += 1e-6 * np.eye(n_s)
+    K_ss += 1e-4 * np.eye(n_s)
 
     def objective(beta):
         return 0.5 * beta @ K_ss @ beta - kappa @ beta
@@ -61,15 +95,13 @@ def compute_kmm_weights_fast(X_source, X_target, gamma=None, B=10.0, eps=0.1):
     result = minimize(
         objective, x0=np.ones(n_s), jac=jac,
         method="L-BFGS-B", bounds=bounds,
-        options={"maxiter": 200, "ftol": 1e-8},
+        options={"maxiter": 100, "ftol": 1e-6},
     )
     w = np.maximum(result.x, 0)
-    # sum制約の近似: wをスケーリングしてsum(w) ≈ n_s
     w_sum = w.sum()
     if w_sum > 0:
         w = w * (n_s / w_sum)
-    w = np.clip(w, 0, B)
-    return w
+    return np.clip(w, 0, B)
 
 
 def rmse(y_true, y_pred):

@@ -218,7 +218,7 @@ def main():
     print("=" * 70)
 
     # ============================================================
-    # SA構成の生成（主要な組み合わせに絞る）
+    # SA構成の生成（計算時間を考慮して絞る）
     # ============================================================
     sa_configs = []
     for pp_name in ["raw", "SNV", "EPO(1)"]:
@@ -264,134 +264,166 @@ def main():
     print(f"\n総モデル数: {n_total} (SA: {len(sa_configs)}, CORAL: {len(coral_configs)})")
 
     # ============================================================
-    # SA/CORAL特徴量のキャッシュ（前処理+次元削減を事前計算）
+    # インクリメンタル評価: SA/CORAL特徴量を1グループずつ計算し回帰評価
+    # メモリを節約しつつ前処理のキャッシュを活用
     # ============================================================
-    print(f"\n--- 特徴量キャッシュ構築 ---\n", flush=True)
+    # config_idxを管理するためのマッピング
+    all_preds = [[] for _ in range(n_total)]
+    all_rmses = [None] * n_total
+    best_rmse_so_far = np.inf
+    completed = 0
 
-    # SA: (pp, sa_nc) -> fold別 (Z_tr, Z_te)
-    sa_cache = {}
-    sa_keys = set()
-    for cfg in sa_configs:
-        sa_keys.add((cfg["pp"], cfg["sa_nc"]))
+    # 前処理キャッシュ: pp_name -> fold別 (X_tr_pp, X_te_pp)
+    pp_cache = {}
 
-    for key_idx, (pp_name, sa_nc) in enumerate(sorted(sa_keys)):
+    def get_pp_cache(pp_name):
+        if pp_name not in pp_cache:
+            fold_data = []
+            for f_idx, (train_idx, test_idx) in enumerate(folds):
+                X_tr_pp, X_te_pp = preprocess(X_raw[train_idx], X_raw[test_idx],
+                                               groups[train_idx], pp_name)
+                fold_data.append((X_tr_pp, X_te_pp))
+            pp_cache[pp_name] = fold_data
+        return pp_cache[pp_name]
+
+    def run_regression(Z_tr, Z_te, y_fit, reg_type, cfg):
+        """キャッシュ済み特徴量に対して回帰を実行"""
+        if reg_type == "PLS":
+            dim = Z_tr.shape[1]
+            nc = min(cfg.get("pls_nc", 4), dim - 1)
+            nc = max(1, nc)
+            pls = PLSRegression(n_components=nc)
+            pls.fit(Z_tr, y_fit)
+            return pls.predict(Z_te).ravel()
+        elif reg_type == "Ridge":
+            sc_obj = StandardScaler()
+            Z_tr_s = sc_obj.fit_transform(Z_tr)
+            Z_te_s = sc_obj.transform(Z_te)
+            ridge = Ridge(alpha=cfg.get("alpha", 1.0))
+            ridge.fit(Z_tr_s, y_fit)
+            return ridge.predict(Z_te_s)
+        elif reg_type == "Huber":
+            sc_obj = StandardScaler()
+            Z_tr_s = sc_obj.fit_transform(Z_tr)
+            Z_te_s = sc_obj.transform(Z_te)
+            huber = HuberRegressor(epsilon=1.35, max_iter=200, alpha=0.01)
+            huber.fit(Z_tr_s, y_fit)
+            return huber.predict(Z_te_s)
+        else:
+            raise ValueError(f"Unknown reg: {reg_type}")
+
+    # --- SA評価: (pp, sa_nc) グループごとに処理 ---
+    print(f"\n--- SA評価 ---\n", flush=True)
+
+    sa_groups = {}
+    for m_idx, cfg in enumerate(sa_configs):
+        key = (cfg["pp"], cfg["sa_nc"])
+        if key not in sa_groups:
+            sa_groups[key] = []
+        sa_groups[key].append((m_idx, cfg))
+
+    for grp_idx, (key, cfgs_in_group) in enumerate(sorted(sa_groups.items())):
+        pp_name, sa_nc = key
         t1 = time.time()
-        fold_data = []
-        for f_idx, (train_idx, test_idx) in enumerate(folds):
-            X_tr_pp, X_te_pp = preprocess(X_raw[train_idx], X_raw[test_idx],
-                                           groups[train_idx], pp_name)
+
+        # SA特徴量をfold別に計算
+        pp_data = get_pp_cache(pp_name)
+        sa_fold_data = []
+        for f_idx, (X_tr_pp, X_te_pp) in enumerate(pp_data):
             Z_tr, Z_te = subspace_align(X_tr_pp, X_te_pp, n_components=sa_nc)
-            fold_data.append((Z_tr, Z_te))
-        sa_cache[(pp_name, sa_nc)] = fold_data
-        print(f"  SA cache [{key_idx+1}/{len(sa_keys)}] pp={pp_name}, nc={sa_nc} ({time.time()-t1:.1f}s)", flush=True)
+            sa_fold_data.append((Z_tr, Z_te))
 
-    # CORAL: (pp, pca_dim) -> fold別 (X_tr_coral, X_te_coral)
-    coral_cache = {}
-    coral_keys = set()
-    for cfg in coral_configs:
-        coral_keys.add((cfg["pp"], cfg["pca_dim"]))
+        cache_time = time.time() - t1
 
-    for key_idx, (pp_name, pca_dim) in enumerate(sorted(coral_keys)):
+        # このグループ内の全回帰モデルを評価
+        for m_idx, cfg in cfgs_in_group:
+            fold_rmses = []
+            for f_idx, (train_idx, test_idx) in enumerate(folds):
+                try:
+                    y_train = y[train_idx]
+                    tf = cfg["tf"]
+                    y_fit = np.sqrt(y_train) if tf == "sqrt" else y_train.copy()
+                    Z_tr, Z_te = sa_fold_data[f_idx]
+                    pred = run_regression(Z_tr, Z_te, y_fit, cfg["reg"], cfg)
+                    if tf == "sqrt":
+                        pred = np.clip(pred, 0, None) ** 2
+                    all_preds[m_idx].append(pred)
+                    fold_rmses.append(rmse(y[test_idx], pred))
+                except Exception as e:
+                    fallback = np.full(len(test_idx), y[train_idx].mean())
+                    all_preds[m_idx].append(fallback)
+                    fold_rmses.append(999.0)
+                    print(f"  ERROR {cfg['name']} fold {f_idx}: {e}")
+
+            mean_r = np.mean(fold_rmses)
+            all_rmses[m_idx] = mean_r
+            completed += 1
+            nb = [r for sp, r in zip(sp_names, fold_rmses) if sp != "ベイスギ"]
+            avg_nb = np.mean(nb) if nb else mean_r
+
+            if mean_r < best_rmse_so_far:
+                best_rmse_so_far = mean_r
+                print(f"  [{completed:>3}/{n_total}] ★BEST★ {cfg['name']}: {mean_r:.2f} (除ベイスギ:{avg_nb:.2f})", flush=True)
+
+        print(f"  SA [{grp_idx+1}/{len(sa_groups)}] pp={pp_name}, nc={sa_nc}: {len(cfgs_in_group)}モデル完了 (cache:{cache_time:.0f}s, best_so_far:{best_rmse_so_far:.2f})", flush=True)
+
+    # --- CORAL評価: (pp, pca_dim) グループごとに処理 ---
+    print(f"\n--- CORAL評価 ---\n", flush=True)
+
+    coral_groups = {}
+    for m_idx_offset, cfg in enumerate(coral_configs):
+        m_idx = len(sa_configs) + m_idx_offset
+        key = (cfg["pp"], cfg["pca_dim"])
+        if key not in coral_groups:
+            coral_groups[key] = []
+        coral_groups[key].append((m_idx, cfg))
+
+    for grp_idx, (key, cfgs_in_group) in enumerate(sorted(coral_groups.items())):
+        pp_name, pca_dim = key
         t1 = time.time()
-        fold_data = []
-        for f_idx, (train_idx, test_idx) in enumerate(folds):
-            X_tr_pp, X_te_pp = preprocess(X_raw[train_idx], X_raw[test_idx],
-                                           groups[train_idx], pp_name)
+
+        # CORAL特徴量をfold別に計算
+        pp_data = get_pp_cache(pp_name)
+        coral_fold_data = []
+        for f_idx, (X_tr_pp, X_te_pp) in enumerate(pp_data):
             pca = PCA(n_components=pca_dim)
             X_tr_pca = pca.fit_transform(X_tr_pp)
             X_te_pca = pca.transform(X_te_pp)
-            X_tr_coral, X_te_coral = coral_transform(X_tr_pca, X_te_pca)
-            fold_data.append((X_tr_coral, X_te_coral))
-        coral_cache[(pp_name, pca_dim)] = fold_data
-        print(f"  CORAL cache [{key_idx+1}/{len(coral_keys)}] pp={pp_name}, pca={pca_dim} ({time.time()-t1:.1f}s)", flush=True)
+            X_tr_c, X_te_c = coral_transform(X_tr_pca, X_te_pca)
+            coral_fold_data.append((X_tr_c, X_te_c))
 
-    # ============================================================
-    # LOSO-CV評価（キャッシュ使用で高速）
-    # ============================================================
-    all_preds = [[] for _ in range(n_total)]
-    all_rmses = []
-    best_rmse_so_far = np.inf
+        cache_time = time.time() - t1
 
-    print(f"\n--- LOSO-CV 個別モデル評価 ---\n", flush=True)
+        for m_idx, cfg in cfgs_in_group:
+            fold_rmses = []
+            for f_idx, (train_idx, test_idx) in enumerate(folds):
+                try:
+                    y_train = y[train_idx]
+                    tf = cfg["tf"]
+                    y_fit = np.sqrt(y_train) if tf == "sqrt" else y_train.copy()
+                    X_tr_c, X_te_c = coral_fold_data[f_idx]
+                    pred = run_regression(X_tr_c, X_te_c, y_fit, cfg["reg"], cfg)
+                    if tf == "sqrt":
+                        pred = np.clip(pred, 0, None) ** 2
+                    all_preds[m_idx].append(pred)
+                    fold_rmses.append(rmse(y[test_idx], pred))
+                except Exception as e:
+                    fallback = np.full(len(test_idx), y[train_idx].mean())
+                    all_preds[m_idx].append(fallback)
+                    fold_rmses.append(999.0)
+                    print(f"  ERROR {cfg['name']} fold {f_idx}: {e}")
 
-    for m_idx, cfg in enumerate(all_configs):
-        t1 = time.time()
-        fold_rmses = []
-        is_sa = cfg["func"] == predict_sa
+            mean_r = np.mean(fold_rmses)
+            all_rmses[m_idx] = mean_r
+            completed += 1
+            nb = [r for sp, r in zip(sp_names, fold_rmses) if sp != "ベイスギ"]
+            avg_nb = np.mean(nb) if nb else mean_r
 
-        for f_idx, (train_idx, test_idx) in enumerate(folds):
-            try:
-                y_train = y[train_idx]
-                tf = cfg["tf"]
-                y_fit = np.sqrt(y_train) if tf == "sqrt" else y_train.copy()
+            if mean_r < best_rmse_so_far:
+                best_rmse_so_far = mean_r
+                print(f"  [{completed:>3}/{n_total}] ★BEST★ {cfg['name']}: {mean_r:.2f} (除ベイスギ:{avg_nb:.2f})", flush=True)
 
-                if is_sa:
-                    Z_tr, Z_te = sa_cache[(cfg["pp"], cfg["sa_nc"])][f_idx]
-                    reg_type = cfg["reg"]
-                    if reg_type == "PLS":
-                        nc = min(cfg.get("pls_nc", cfg["sa_nc"]), cfg["sa_nc"] - 1)
-                        nc = max(1, nc)
-                        pls = PLSRegression(n_components=nc)
-                        pls.fit(Z_tr, y_fit)
-                        pred = pls.predict(Z_te).ravel()
-                    elif reg_type == "Ridge":
-                        sc_obj = StandardScaler()
-                        Z_tr_s = sc_obj.fit_transform(Z_tr)
-                        Z_te_s = sc_obj.transform(Z_te)
-                        ridge = Ridge(alpha=cfg.get("alpha", 1.0))
-                        ridge.fit(Z_tr_s, y_fit)
-                        pred = ridge.predict(Z_te_s)
-                    elif reg_type == "Huber":
-                        sc_obj = StandardScaler()
-                        Z_tr_s = sc_obj.fit_transform(Z_tr)
-                        Z_te_s = sc_obj.transform(Z_te)
-                        huber = HuberRegressor(epsilon=1.35, max_iter=200, alpha=0.01)
-                        huber.fit(Z_tr_s, y_fit)
-                        pred = huber.predict(Z_te_s)
-                    else:
-                        raise ValueError(f"Unknown reg: {reg_type}")
-                else:
-                    X_tr_c, X_te_c = coral_cache[(cfg["pp"], cfg["pca_dim"])][f_idx]
-                    reg_type = cfg["reg"]
-                    if reg_type == "PLS":
-                        nc = min(cfg.get("pls_nc", 4), cfg["pca_dim"] - 1)
-                        nc = max(1, nc)
-                        pls = PLSRegression(n_components=nc)
-                        pls.fit(X_tr_c, y_fit)
-                        pred = pls.predict(X_te_c).ravel()
-                    elif reg_type == "Ridge":
-                        sc_obj = StandardScaler()
-                        X_tr_s = sc_obj.fit_transform(X_tr_c)
-                        X_te_s = sc_obj.transform(X_te_c)
-                        ridge = Ridge(alpha=cfg.get("alpha", 1.0))
-                        ridge.fit(X_tr_s, y_fit)
-                        pred = ridge.predict(X_te_s)
-                    else:
-                        raise ValueError(f"Unknown reg: {reg_type}")
-
-                if tf == "sqrt":
-                    pred = np.clip(pred, 0, None) ** 2
-
-                all_preds[m_idx].append(pred)
-                fold_rmses.append(rmse(y[test_idx], pred))
-            except Exception as e:
-                fallback = np.full(len(test_idx), y[train_idx].mean())
-                all_preds[m_idx].append(fallback)
-                fold_rmses.append(999.0)
-                print(f"  ERROR {cfg['name']} fold {f_idx}: {e}")
-
-        mean_r = np.mean(fold_rmses)
-        all_rmses.append(mean_r)
-        nb = [r for sp, r in zip(sp_names, fold_rmses) if sp != "ベイスギ"]
-        avg_nb = np.mean(nb) if nb else mean_r
-        elapsed = time.time() - t1
-
-        # 進捗表示
-        if (m_idx + 1) % 20 == 0 or m_idx == 0:
-            print(f"  [{m_idx+1:>3}/{n_total}] {cfg['name']}: {mean_r:.2f} (除ベイスギ:{avg_nb:.2f}) ({elapsed:.1f}s)", flush=True)
-        if mean_r < best_rmse_so_far:
-            best_rmse_so_far = mean_r
-            print(f"  [{m_idx+1:>3}/{n_total}] ★BEST★ {cfg['name']}: {mean_r:.2f} (除ベイスギ:{avg_nb:.2f}) ({elapsed:.1f}s)", flush=True)
+        print(f"  CORAL [{grp_idx+1}/{len(coral_groups)}] pp={pp_name}, pca={pca_dim}: {len(cfgs_in_group)}モデル完了 (cache:{cache_time:.0f}s, best_so_far:{best_rmse_so_far:.2f})", flush=True)
 
     # ============================================================
     # 個別モデルランキング

@@ -331,12 +331,39 @@ def predict_without_tta(X_train, y_train, groups_train, X_test, model_cfgs):
 # LOSO-CV評価（高速版）
 # ============================================================
 
-def evaluate_tta_cv(X, y, groups, model_cfgs, n_aug=10, seed=42, tta_params=None):
-    """LOSO-CVでTTAあり/なしを評価する（キャッシュ使用高速版）。"""
+def build_fold_caches(X, y, groups, model_cfgs):
+    """全LOSOフォールドの全モデルのキャッシュを事前構築する。
+
+    Returns
+    -------
+    fold_caches : list of list of dict
+        fold_caches[fold_idx][model_idx] = cache dict
+    folds : list of (train_idx, test_idx)
+    species_list : list of str
+    """
     logo = LeaveOneGroupOut()
     folds = list(logo.split(X, y, groups))
     species_list = [np.unique(groups[te])[0] for _, te in folds]
 
+    fold_caches = []
+    for fold_idx, (train_idx, test_idx) in enumerate(folds):
+        X_tr = X[train_idx]
+        y_tr = y[train_idx]
+        g_tr = groups[train_idx]
+        caches = []
+        for cfg in model_cfgs:
+            cache = build_train_cache(X_tr, y_tr, g_tr, cfg)
+            caches.append(cache)
+        fold_caches.append(caches)
+        print(f"  キャッシュ構築 Fold {fold_idx+1}/{len(folds)} [{species_list[fold_idx]}]",
+              flush=True)
+
+    return fold_caches, folds, species_list
+
+
+def evaluate_tta_cv_with_cache(X, y, groups, fold_caches, folds, species_list,
+                                n_aug=10, seed=42, tta_params=None, verbose=True):
+    """事前構築済みキャッシュを使ってTTAあり/なしを評価する。"""
     if tta_params is None:
         tta_params_use = {}
     else:
@@ -346,16 +373,10 @@ def evaluate_tta_cv(X, y, groups, model_cfgs, n_aug=10, seed=42, tta_params=None
     results_notta = []
 
     for fold_idx, (train_idx, test_idx) in enumerate(folds):
-        X_tr, X_te = X[train_idx], X[test_idx]
-        y_tr, y_te = y[train_idx], y[test_idx]
-        g_tr = groups[train_idx]
+        X_te = X[test_idx]
+        y_te = y[test_idx]
         sp = species_list[fold_idx]
-
-        # 各モデルのキャッシュを構築（1回のみ）
-        caches = []
-        for cfg in model_cfgs:
-            cache = build_train_cache(X_tr, y_tr, g_tr, cfg)
-            caches.append(cache)
+        caches = fold_caches[fold_idx]
 
         # TTAなし予測
         preds_notta = []
@@ -386,9 +407,10 @@ def evaluate_tta_cv(X, y, groups, model_cfgs, n_aug=10, seed=42, tta_params=None
 
         results_tta.append({"species": sp, "rmse": r_tta})
 
-        print(f"  Fold {fold_idx+1}/{len(folds)} [{sp}]: "
-              f"NoTTA={r_notta:.2f}, TTA={r_tta:.2f}, "
-              f"diff={r_tta - r_notta:+.2f}")
+        if verbose:
+            print(f"  Fold {fold_idx+1}/{len(folds)} [{sp}]: "
+                  f"NoTTA={r_notta:.2f}, TTA={r_tta:.2f}, "
+                  f"diff={r_tta - r_notta:+.2f}")
 
     mean_notta = np.mean([r["rmse"] for r in results_notta])
     mean_tta = np.mean([r["rmse"] for r in results_tta])
@@ -402,6 +424,15 @@ def evaluate_tta_cv(X, y, groups, model_cfgs, n_aug=10, seed=42, tta_params=None
         "tta": {"folds": results_tta, "mean_rmse": mean_tta, "mean_rmse_no_beisugi": mean_tta_nobs},
         "notta": {"folds": results_notta, "mean_rmse": mean_notta, "mean_rmse_no_beisugi": mean_notta_nobs},
     }
+
+
+def evaluate_tta_cv(X, y, groups, model_cfgs, n_aug=10, seed=42, tta_params=None):
+    """LOSO-CVでTTAあり/なしを評価する（後方互換版）。"""
+    fold_caches, folds, species_list = build_fold_caches(X, y, groups, model_cfgs)
+    return evaluate_tta_cv_with_cache(
+        X, y, groups, fold_caches, folds, species_list,
+        n_aug=n_aug, seed=seed, tta_params=tta_params
+    )
 
 
 # ============================================================
@@ -438,11 +469,21 @@ def main():
     ]
 
     # ========================================
+    # キャッシュ構築（1回のみ、全フェーズで再利用）
+    # ========================================
+    print("\n--- キャッシュ構築（全フォールド x 全モデル）---")
+    t_cache = time.time()
+    fold_caches, folds, species_list = build_fold_caches(
+        X_train, y_train, groups_train, model_cfgs
+    )
+    print(f"  キャッシュ構築完了: {time.time() - t_cache:.1f}s")
+
+    # ========================================
     # Phase 1: LOSO-CVベースライン
     # ========================================
     print("\n--- Phase 1: ベースライン（TTAなし）LOSO-CV ---")
-    cv_base = evaluate_tta_cv(
-        X_train, y_train, groups_train, model_cfgs,
+    cv_base = evaluate_tta_cv_with_cache(
+        X_train, y_train, groups_train, fold_caches, folds, species_list,
         n_aug=0, seed=42, tta_params=None
     )
     baseline_rmse = cv_base['notta']['mean_rmse']
@@ -452,8 +493,8 @@ def main():
     # Phase 2: デフォルトTTA
     # ========================================
     print("\n--- Phase 2: デフォルトTTA (n_aug=10) ---")
-    cv_default = evaluate_tta_cv(
-        X_train, y_train, groups_train, model_cfgs,
+    cv_default = evaluate_tta_cv_with_cache(
+        X_train, y_train, groups_train, fold_caches, folds, species_list,
         n_aug=10, seed=42, tta_params=None
     )
     print(f"\nデフォルトTTA RMSE: {cv_default['tta']['mean_rmse']:.4f}")
@@ -461,7 +502,7 @@ def main():
     print(f"差分: {cv_default['tta']['mean_rmse'] - cv_default['notta']['mean_rmse']:+.4f}")
 
     # ========================================
-    # Phase 3: ノイズレベル最適化（逐次的に各パラメータを最適化）
+    # Phase 3: ノイズレベル最適化
     # ========================================
     print("\n--- Phase 3: ノイズレベル最適化 ---")
 
@@ -489,9 +530,9 @@ def main():
             params = best_params.copy()
             params[param_name] = val
 
-            cv_result = evaluate_tta_cv(
-                X_train, y_train, groups_train, model_cfgs,
-                n_aug=10, seed=42, tta_params=params
+            cv_result = evaluate_tta_cv_with_cache(
+                X_train, y_train, groups_train, fold_caches, folds, species_list,
+                n_aug=10, seed=42, tta_params=params, verbose=False
             )
             r = cv_result['tta']['mean_rmse']
             grid_results.append({
@@ -516,9 +557,9 @@ def main():
     n_aug_results = []
 
     for n_aug in n_aug_values:
-        cv_result = evaluate_tta_cv(
-            X_train, y_train, groups_train, model_cfgs,
-            n_aug=n_aug, seed=42, tta_params=best_params
+        cv_result = evaluate_tta_cv_with_cache(
+            X_train, y_train, groups_train, fold_caches, folds, species_list,
+            n_aug=n_aug, seed=42, tta_params=best_params, verbose=False
         )
         r = cv_result['tta']['mean_rmse']
         n_aug_results.append({"n_aug": n_aug, "rmse_tta": r})
@@ -532,8 +573,8 @@ def main():
     # Phase 5: 最終評価
     # ========================================
     print("\n--- Phase 5: 最終評価 ---")
-    cv_final = evaluate_tta_cv(
-        X_train, y_train, groups_train, model_cfgs,
+    cv_final = evaluate_tta_cv_with_cache(
+        X_train, y_train, groups_train, fold_caches, folds, species_list,
         n_aug=best_n_aug, seed=42, tta_params=best_params
     )
     print(f"\n最終TTA RMSE: {cv_final['tta']['mean_rmse']:.4f}")

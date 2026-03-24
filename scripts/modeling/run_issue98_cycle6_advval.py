@@ -263,15 +263,41 @@ def main():
         print(f"    {sp}: 重み={avg_w:.3f}, testらしさ={avg_p:.3f} (n={mask.sum()})")
 
     # ============================================================
-    # Step 2: LOSO-CV評価（各foldでAdversarial Weightを再計算）
+    # Step 2: LOSO-CV評価（事前計算した重みを再利用して高速化）
     # ============================================================
     print("\n--- Step 2: LOSO-CV評価 ---\n")
+
+    # 各foldのadversarial weightsを事前計算（高速化）
+    print("  各foldのadversarial weightsを事前計算中...")
+    fold_weights = {}
+    for f_idx, (train_idx, test_idx) in enumerate(folds):
+        w_fold, auc_fold, _ = compute_adversarial_weights(
+            X_raw[train_idx], X_test_raw, n_pca=50
+        )
+        fold_weights[f_idx] = w_fold
+        print(f"    fold {f_idx} ({sp_names[f_idx]}): AUC={auc_fold:.4f}", flush=True)
+    print("  事前計算完了\n")
+
+    # 前処理結果も事前キャッシュ
+    print("  前処理結果を事前キャッシュ中...")
+    pp_list = ["EPO(1)", "SNV", "SNV+AsLS", "PMSC"]
+    pp_cache = {}
+    for pp in pp_list:
+        t_pp = time.time()
+        pp_cache[pp] = []
+        for f_idx, (train_idx, test_idx) in enumerate(folds):
+            X_tr_pp, X_te_pp = preprocess(
+                X_raw[train_idx], X_raw[test_idx], groups[train_idx], pp
+            )
+            pp_cache[pp].append((X_tr_pp, X_te_pp))
+        print(f"    {pp}: {time.time()-t_pp:.1f}s", flush=True)
+    print("  前処理キャッシュ完了\n")
 
     # モデル構成
     configs = []
 
     # 前処理 × モデル × 変換の組み合わせ
-    for pp in ["EPO(1)", "SNV", "SNV+AsLS", "PMSC"]:
+    for pp in pp_list:
         for tf in ["sqrt", "raw"]:
             # PLS (重みなし baseline)
             configs.append({
@@ -321,21 +347,14 @@ def main():
 
         for f_idx, (train_idx, test_idx) in enumerate(folds):
             try:
-                X_tr_raw_fold = X_raw[train_idx]
-                X_te_raw_fold = X_raw[test_idx]
                 y_train = y[train_idx]
-                groups_train = groups[train_idx]
 
-                # 前処理
-                X_tr_pp, X_te_pp = preprocess(
-                    X_tr_raw_fold, X_te_raw_fold, groups_train, cfg["pp"]
-                )
+                # 事前キャッシュから前処理結果を取得
+                X_tr_pp, X_te_pp = pp_cache[cfg["pp"]][f_idx]
 
-                # Adversarial weightはfold内のtrainとtest全体で計算
+                # 事前計算した重みを取得
                 if cfg["use_weight"]:
-                    w_fold, _, _ = compute_adversarial_weights(
-                        X_tr_raw_fold, X_test_raw, n_pca=50
-                    )
+                    w_fold = fold_weights[f_idx]
                 else:
                     w_fold = np.ones(len(train_idx))
 
@@ -353,11 +372,10 @@ def main():
         elapsed = time.time() - t1
 
         # 進捗表示
-        if (m_idx + 1) % 10 == 0 or m_idx == 0 or m_idx == n_models - 1:
-            nb = [r for sp, r in zip(sp_names, fold_rmses) if sp != "ベイスギ"]
-            avg_nb = np.mean(nb) if nb else mean_r
-            print(f"  [{m_idx+1:>3}/{n_models}] {cfg['name']}: "
-                  f"{mean_r:.2f} (除ベイスギ:{avg_nb:.2f}) ({elapsed:.1f}s)", flush=True)
+        nb = [r for sp, r in zip(sp_names, fold_rmses) if sp != "ベイスギ"]
+        avg_nb = np.mean(nb) if nb else mean_r
+        print(f"  [{m_idx+1:>3}/{n_models}] {cfg['name']}: "
+              f"{mean_r:.2f} (除ベイスギ:{avg_nb:.2f}) ({elapsed:.1f}s)", flush=True)
 
     # ============================================================
     # 結果ランキング

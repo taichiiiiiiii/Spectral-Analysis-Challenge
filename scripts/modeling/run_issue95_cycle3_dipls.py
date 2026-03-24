@@ -1,14 +1,13 @@
-"""di-PLSドメイン適応のアンサンブル統合（PCA次元削減+高速版）
+"""di-PLSドメイン適応のアンサンブル統合（高速版）
 
 Issue #95 Cycle 3: di-PLSでLOSO-CVおよびテスト予測を行う。
+XtXの漸化式更新で高速化。
 
 パラメータグリッド:
-- n_components: [2, 3, 4, 5, 6]
-- dipls_lambda: [0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0]
-- 前処理: [raw, SNV, EPO(1), SG2d]
+- n_components: [3, 4, 5]
+- dipls_lambda: [0.1, 1.0, 10.0, 100.0]
+- 前処理: [raw, SNV, SG2d]
 - 目的変数変換: [raw, sqrt]
-
-高速化: PCA(n=50)で1555次元→50次元に削減してからdi-PLSを適用
 """
 import sys
 import time
@@ -18,7 +17,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.decomposition import PCA
 from sklearn.model_selection import LeaveOneGroupOut
 
 warnings.filterwarnings("ignore")
@@ -37,8 +35,6 @@ DATA_DIR = PROJECT_ROOT / "Input_data"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-PCA_N_COMPONENTS = 50  # di-PLS入力の次元数
-
 
 def preprocess_pair(X_train_raw, X_test_raw, groups_train, method):
     """前処理を適用する。"""
@@ -56,6 +52,96 @@ def preprocess_pair(X_train_raw, X_test_raw, groups_train, method):
         raise ValueError(f"Unknown method: {method}")
 
 
+def nipals_dipls_batch_fast(X_s, y_s, X_t, max_components, lambda_list):
+    """複数のlambdaに対してdi-PLSをバッチ実行（XtX漸化式更新で高速化）。
+
+    Returns
+    -------
+    dict of (n_comp, lam) -> predictions
+    """
+    n_s, p = X_s.shape
+
+    x_mean = X_s.mean(axis=0)
+    y_mean = y_s.mean()
+
+    # 初期XtXを1回だけ計算
+    X_sc_init = X_s - x_mean
+    X_tc_init = X_t - x_mean
+    y_c_init = y_s - y_mean
+
+    XtX_init = X_sc_init.T @ X_sc_init  # 最も重い計算、1回だけ
+    Xty_init = X_sc_init.T @ y_c_init
+
+    results = {}
+
+    for lam in lambda_list:
+        X_sc = X_sc_init.copy()
+        X_tc = X_tc_init.copy()
+        y_c = y_c_init.copy()
+        XtX = XtX_init.copy()
+        Xty = Xty_init.copy()
+
+        W = np.zeros((p, max_components))
+        P_load = np.zeros((p, max_components))
+        Q = np.zeros(max_components)
+
+        mean_diff = X_sc.mean(axis=0) - X_tc.mean(axis=0)
+        D = np.outer(mean_diff, mean_diff)
+
+        for a in range(max_components):
+            A_mat = XtX + lam * D + 1e-8 * np.eye(p)
+            w = np.linalg.solve(A_mat, Xty)
+            w = w / (np.linalg.norm(w) + 1e-12)
+
+            t = X_sc @ w
+            tt = t @ t + 1e-12
+            # p_load = X_sc^T @ t / (t^T t)  using XtX is wrong since Xty is not t
+            # need X_sc^T @ t directly
+            Xt_t = XtX @ w * (t @ t) / tt  # NOT correct
+            # Actually: X_sc^T @ t = X_sc^T @ (X_sc @ w) = XtX @ w
+            Xt_t_vec = XtX @ w
+            p_l = Xt_t_vec / tt
+            q = y_c @ t / tt
+
+            W[:, a] = w
+            P_load[:, a] = p_l
+            Q[a] = q
+
+            # Deflate X_sc: X_new = X_sc - outer(t, p_l)
+            # Update XtX using recurrence:
+            # X_new^T X_new = XtX - XtX @ outer(w, p_l) - outer(p_l, w) @ XtX
+            #                 + (t^T t) * outer(p_l, p_l)
+            # Since t = X_sc @ w, X_sc^T t = XtX @ w
+            XtX_w = XtX @ w  # = X_sc^T @ t
+            # X_new^T X_new = XtX - outer(XtX_w, p_l) - outer(p_l, XtX_w) + tt * outer(p_l, p_l)
+            XtX = XtX - np.outer(XtX_w, p_l) - np.outer(p_l, XtX_w) + tt * np.outer(p_l, p_l)
+
+            # Update Xty: X_new^T y_new where y_new = y_c - t*q
+            # X_new^T y_new = (X_sc - outer(t,p_l))^T (y_c - t*q)
+            # = X_sc^T y_c - X_sc^T t * q - p_l * (t^T y_c) + p_l * (t^T t) * q
+            # = Xty - XtX_w * q - p_l * (t @ y_c) + p_l * tt * q
+            # Note: t @ y_c = q * tt (from definition of q)
+            Xty = Xty - XtX_w * q - p_l * (t @ y_c) + p_l * tt * q
+
+            # Deflate X_sc and X_tc for mean_diff update
+            X_sc = X_sc - np.outer(t, p_l)
+            X_tc = X_tc - X_tc @ np.outer(w, p_l)
+            y_c = y_c - t * q
+
+            mean_diff = X_sc.mean(axis=0) - X_tc.mean(axis=0)
+            D = np.outer(mean_diff, mean_diff)
+
+            # Store prediction for this n_comp
+            nc = a + 1
+            R = W[:, :nc] @ np.linalg.inv(P_load[:, :nc].T @ W[:, :nc] + 1e-10 * np.eye(nc))
+            B = R @ Q[:nc]
+            X_target_c = X_t - x_mean
+            pred = X_target_c @ B + y_mean
+            results[(nc, lam)] = pred
+
+    return results
+
+
 def run_loso_cv_batch(df_train, spectral_cols, preproc_method, y_transform,
                       n_components_list, lambda_list):
     """1つの(前処理, y変換)に対し、全(n_comp, lambda)のLOSO-CVを実行。"""
@@ -64,13 +150,17 @@ def run_loso_cv_batch(df_train, spectral_cols, preproc_method, y_transform,
     groups = df_train["樹種"].values
     logo = LeaveOneGroupOut()
 
-    # 結果格納
-    results = {}
-    for nc, lam in product(n_components_list, lambda_list):
-        results[(nc, lam)] = {"preds": np.full(len(y), np.nan), "fold_rmses": {}}
+    max_comp = max(n_components_list)
 
-    # fold別に処理
+    all_preds = {}
+    fold_rmses = {}
+    for nc, lam in product(n_components_list, lambda_list):
+        all_preds[(nc, lam)] = np.full(len(y), np.nan)
+        fold_rmses[(nc, lam)] = {}
+
+    fold_count = 0
     for train_idx, test_idx in logo.split(X_raw, y, groups):
+        fold_count += 1
         species = groups[test_idx][0]
         X_train_raw = X_raw[train_idx]
         X_test_raw = X_raw[test_idx]
@@ -78,44 +168,31 @@ def run_loso_cv_batch(df_train, spectral_cols, preproc_method, y_transform,
         y_test = y[test_idx]
         groups_train = groups[train_idx]
 
-        # 前処理（foldごとに1回だけ）
         X_tr_pp, X_te_pp = preprocess_pair(X_train_raw, X_test_raw,
                                             groups_train, preproc_method)
+        y_fit = np.sqrt(y_train) if y_transform == "sqrt" else y_train
 
-        # PCA次元削減（trainでfit, testはtransform）
-        pca = PCA(n_components=PCA_N_COMPONENTS)
-        X_tr_pca = pca.fit_transform(X_tr_pp)
-        X_te_pca = pca.transform(X_te_pp)
+        # バッチdi-PLS（高速版）
+        batch_preds = nipals_dipls_batch_fast(X_tr_pp, y_fit, X_te_pp,
+                                              max_comp, lambda_list)
 
-        # 目的変数変換
-        if y_transform == "sqrt":
-            y_fit = np.sqrt(y_train)
-        else:
-            y_fit = y_train
-
-        # 全(n_comp, lambda)の組合せを実行
         for nc in n_components_list:
             for lam in lambda_list:
-                try:
-                    pred = fit_predict_dipls(
-                        X_tr_pca, y_fit, X_te_pca,
-                        n_components=nc, dipls_lambda=lam
-                    )
-                except Exception:
-                    pred = np.full(len(test_idx), np.nan)
-
-                # 逆変換
+                pred = batch_preds.get((nc, lam))
+                if pred is None:
+                    continue
                 if y_transform == "sqrt":
                     pred = np.clip(pred, 0, None) ** 2
-
-                results[(nc, lam)]["preds"][test_idx] = pred
+                all_preds[(nc, lam)][test_idx] = pred
                 fold_rmse = float(np.sqrt(np.mean((pred - y_test) ** 2)))
-                results[(nc, lam)]["fold_rmses"][species] = fold_rmse
+                fold_rmses[(nc, lam)][species] = fold_rmse
 
-    # 全体RMSE計算
+        sys.stdout.write(f"    fold {fold_count}/13 ({species}) done\n")
+        sys.stdout.flush()
+
     output = []
-    for (nc, lam), data in results.items():
-        preds = data["preds"]
+    for (nc, lam) in product(n_components_list, lambda_list):
+        preds = all_preds[(nc, lam)]
         if np.any(np.isnan(preds)):
             continue
         overall_rmse = float(np.sqrt(np.mean((preds - y) ** 2)))
@@ -126,106 +203,52 @@ def run_loso_cv_batch(df_train, spectral_cols, preproc_method, y_transform,
             "dipls_lambda": lam,
             "rmse": overall_rmse,
         }
-        for species, fold_rmse in data["fold_rmses"].items():
+        for species, fold_rmse in fold_rmses[(nc, lam)].items():
             row[f"rmse_{species}"] = fold_rmse
         output.append(row)
 
-    return output
-
-
-def run_loso_cv_batch_nopca(df_train, spectral_cols, preproc_method, y_transform,
-                            n_components_list, lambda_list):
-    """PCAなしバージョン（参考用、1設定のみ）。"""
-    X_raw = df_train[spectral_cols].values
-    y = df_train["含水率"].values
-    groups = df_train["樹種"].values
-    logo = LeaveOneGroupOut()
-
-    results = {}
-    for nc, lam in product(n_components_list, lambda_list):
-        results[(nc, lam)] = {"preds": np.full(len(y), np.nan), "fold_rmses": {}}
-
-    for train_idx, test_idx in logo.split(X_raw, y, groups):
-        species = groups[test_idx][0]
-        X_train_raw = X_raw[train_idx]
-        X_test_raw = X_raw[test_idx]
-        y_train = y[train_idx].copy()
-        y_test = y[test_idx]
-        groups_train = groups[train_idx]
-
-        X_tr_pp, X_te_pp = preprocess_pair(X_train_raw, X_test_raw,
-                                            groups_train, preproc_method)
-        if y_transform == "sqrt":
-            y_fit = np.sqrt(y_train)
-        else:
-            y_fit = y_train
-
-        for nc in n_components_list:
-            for lam in lambda_list:
-                try:
-                    pred = fit_predict_dipls(
-                        X_tr_pp, y_fit, X_te_pp,
-                        n_components=nc, dipls_lambda=lam
-                    )
-                except Exception:
-                    pred = np.full(len(test_idx), np.nan)
-                if y_transform == "sqrt":
-                    pred = np.clip(pred, 0, None) ** 2
-                results[(nc, lam)]["preds"][test_idx] = pred
-                fold_rmse = float(np.sqrt(np.mean((pred - y_test) ** 2)))
-                results[(nc, lam)]["fold_rmses"][species] = fold_rmse
-
-    output = []
-    for (nc, lam), data in results.items():
-        preds = data["preds"]
-        if np.any(np.isnan(preds)):
-            continue
-        overall_rmse = float(np.sqrt(np.mean((preds - y) ** 2)))
-        row = {
-            "preproc": preproc_method,
-            "y_transform": y_transform,
-            "n_components": nc,
-            "dipls_lambda": lam,
-            "rmse": overall_rmse,
-        }
-        for species, fold_rmse in data["fold_rmses"].items():
-            row[f"rmse_{species}"] = fold_rmse
-        output.append(row)
     return output
 
 
 def main():
-    print("=" * 70)
-    print("Issue #95 Cycle 3: di-PLS Domain Adaptation")
-    print("=" * 70)
+    sys.stdout.write("=" * 70 + "\n")
+    sys.stdout.write("Issue #95 Cycle 3: di-PLS Domain Adaptation (Fast)\n")
+    sys.stdout.write("=" * 70 + "\n")
+    sys.stdout.flush()
 
     df_train = load_train(DATA_DIR)
     df_test = load_test(DATA_DIR)
     spectral_cols = get_spectral_columns(df_train)
-    print(f"Train: {len(df_train)} samples, Test: {len(df_test)} samples")
-    print(f"Spectral features: {len(spectral_cols)}")
-    print(f"PCA reduction: {len(spectral_cols)} -> {PCA_N_COMPONENTS}")
-    print(f"Species (train): {sorted(df_train['樹種'].unique())}")
-    print()
 
-    n_components_list = [2, 3, 4, 5, 6]
-    lambda_list = [0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0]
-    preproc_list = ["raw", "SNV", "EPO1", "SG2d"]
+    sys.stdout.write(f"Train: {len(df_train)} samples, Test: {len(df_test)} samples\n")
+    sys.stdout.write(f"Spectral features: {len(spectral_cols)}\n")
+    sys.stdout.write(f"Species (train): {sorted(df_train['樹種'].unique())}\n\n")
+    sys.stdout.flush()
+
+    n_components_list = [3, 4, 5]
+    lambda_list = [0.1, 1.0, 10.0, 100.0]
+    preproc_list = ["raw", "SNV", "SG2d"]
     y_transform_list = ["raw", "sqrt"]
 
     total_combos = len(n_components_list) * len(lambda_list) * len(preproc_list) * len(y_transform_list)
-    print(f"Total grid combinations: {total_combos}")
-    print()
+    total_batches = len(preproc_list) * len(y_transform_list)
+
+    sys.stdout.write(f"Total grid combinations: {total_combos}\n")
+    sys.stdout.write(f"Batch groups: {total_batches}\n")
+    sys.stdout.write(f"Optimization: XtX computed once per fold, "
+                     f"recurrence update for deflation\n\n")
+    sys.stdout.flush()
 
     all_results = []
     start_time = time.time()
     batch_count = 0
-    total_batches = len(preproc_list) * len(y_transform_list)
 
     for preproc, y_tf in product(preproc_list, y_transform_list):
         batch_count += 1
         batch_start = time.time()
-        print(f"[Batch {batch_count}/{total_batches}] preproc={preproc}, y_tf={y_tf} ...")
+        sys.stdout.write(f"[Batch {batch_count}/{total_batches}] "
+                        f"preproc={preproc}, y_tf={y_tf}\n")
+        sys.stdout.flush()
 
         batch_results = run_loso_cv_batch(
             df_train, spectral_cols, preproc, y_tf,
@@ -238,75 +261,56 @@ def main():
 
         if batch_results:
             best_in_batch = min(batch_results, key=lambda x: x["rmse"])
-            print(f"  -> {len(batch_results)} results, best RMSE={best_in_batch['rmse']:.4f} "
-                  f"(n_comp={best_in_batch['n_components']}, lambda={best_in_batch['dipls_lambda']}) "
-                  f"[{batch_elapsed:.0f}s / total {total_elapsed:.0f}s]")
-        else:
-            print(f"  -> No valid results [{batch_elapsed:.0f}s]")
+            sys.stdout.write(f"  -> best RMSE={best_in_batch['rmse']:.4f} "
+                           f"(n_comp={best_in_batch['n_components']}, "
+                           f"lambda={best_in_batch['dipls_lambda']}) "
+                           f"[{batch_elapsed:.0f}s / total {total_elapsed:.0f}s]\n\n")
+        sys.stdout.flush()
 
     df_results = pd.DataFrame(all_results).sort_values("rmse").reset_index(drop=True)
 
     # 結果表示
-    print()
-    print("=" * 70)
-    print("LOSO-CV Results (Top 30)")
-    print("=" * 70)
-    top30 = df_results.head(30)
-    for i, row in top30.iterrows():
-        print(f"  #{i+1}: RMSE={row['rmse']:.4f} | preproc={row['preproc']}, "
-              f"y_tf={row['y_transform']}, n_comp={int(row['n_components'])}, "
-              f"lambda={row['dipls_lambda']}")
+    sys.stdout.write("\n" + "=" * 70 + "\n")
+    sys.stdout.write("LOSO-CV Results (Top 20)\n")
+    sys.stdout.write("=" * 70 + "\n")
+    for i, row in df_results.head(20).iterrows():
+        sys.stdout.write(f"  #{i+1}: RMSE={row['rmse']:.4f} | preproc={row['preproc']}, "
+                        f"y_tf={row['y_transform']}, n_comp={int(row['n_components'])}, "
+                        f"lambda={row['dipls_lambda']}\n")
 
-    # 前処理別ベスト
-    print()
-    print("=" * 70)
-    print("Best RMSE by preprocessing")
-    print("=" * 70)
+    sys.stdout.write("\n" + "=" * 70 + "\n")
+    sys.stdout.write("Best RMSE by preprocessing\n")
+    sys.stdout.write("=" * 70 + "\n")
     for preproc in preproc_list:
         subset = df_results[df_results["preproc"] == preproc]
         if len(subset) > 0:
             best_pp = subset.iloc[0]
-            print(f"  {preproc}: RMSE={best_pp['rmse']:.4f} (n_comp={int(best_pp['n_components'])}, "
-                  f"lambda={best_pp['dipls_lambda']}, y_tf={best_pp['y_transform']})")
+            sys.stdout.write(f"  {preproc}: RMSE={best_pp['rmse']:.4f} "
+                           f"(n_comp={int(best_pp['n_components'])}, "
+                           f"lambda={best_pp['dipls_lambda']}, "
+                           f"y_tf={best_pp['y_transform']})\n")
 
-    # ベスト設定のfold別RMSE
     best = df_results.iloc[0]
-    print()
-    print("=" * 70)
-    print(f"Best Setting: preproc={best['preproc']}, y_tf={best['y_transform']}, "
-          f"n_comp={int(best['n_components'])}, lambda={best['dipls_lambda']}")
-    print(f"Overall RMSE: {best['rmse']:.4f}")
-    print("=" * 70)
-    fold_cols = [c for c in df_results.columns if c.startswith("rmse_")]
-    for col in sorted(fold_cols):
+    sys.stdout.write("\n" + "=" * 70 + "\n")
+    sys.stdout.write(f"Best Setting: preproc={best['preproc']}, y_tf={best['y_transform']}, "
+                    f"n_comp={int(best['n_components'])}, lambda={best['dipls_lambda']}\n")
+    sys.stdout.write(f"Overall RMSE: {best['rmse']:.4f}\n")
+    sys.stdout.write("=" * 70 + "\n")
+    fold_cols = sorted([c for c in df_results.columns if c.startswith("rmse_")])
+    for col in fold_cols:
         species = col.replace("rmse_", "")
-        print(f"  {species}: RMSE={best[col]:.4f}")
-
-    # PCAなしで最良設定を再評価（参考）
-    print()
-    print("=" * 70)
-    print("Verification: Best setting WITHOUT PCA reduction (raw 1555-dim)")
-    print("=" * 70)
-    nopca_results = run_loso_cv_batch_nopca(
-        df_train, spectral_cols, best["preproc"], best["y_transform"],
-        [int(best["n_components"])], [best["dipls_lambda"]]
-    )
-    if nopca_results:
-        nopca_best = nopca_results[0]
-        print(f"  RMSE (no PCA): {nopca_best['rmse']:.4f}")
-        for k, v in nopca_best.items():
-            if k.startswith("rmse_"):
-                print(f"    {k.replace('rmse_', '')}: {v:.4f}")
+        sys.stdout.write(f"  {species}: RMSE={best[col]:.4f}\n")
 
     results_path = OUTPUT_DIR / "issue95_dipls_grid_results.csv"
     df_results.to_csv(results_path, index=False)
-    print(f"\nGrid results saved to: {results_path}")
+    sys.stdout.write(f"\nGrid results saved to: {results_path}\n")
+    sys.stdout.flush()
 
-    # テスト予測（ベスト設定 - PCA付き）
-    print()
-    print("=" * 70)
-    print("Test Prediction (Best Setting with PCA)")
-    print("=" * 70)
+    # テスト予測
+    sys.stdout.write("\n" + "=" * 70 + "\n")
+    sys.stdout.write("Test Prediction (Best Setting)\n")
+    sys.stdout.write("=" * 70 + "\n")
+    sys.stdout.flush()
 
     X_train_all = df_train[spectral_cols].values
     X_test_all = df_test[spectral_cols].values
@@ -320,52 +324,30 @@ def main():
 
     X_tr_pp, X_te_pp = preprocess_pair(X_train_all, X_test_all,
                                         groups_train_all, best_preproc)
-    pca = PCA(n_components=PCA_N_COMPONENTS)
-    X_tr_pca = pca.fit_transform(X_tr_pp)
-    X_te_pca = pca.transform(X_te_pp)
+    y_fit = np.sqrt(y_train_all) if best_y_tf == "sqrt" else y_train_all
 
-    if best_y_tf == "sqrt":
-        y_fit = np.sqrt(y_train_all)
-    else:
-        y_fit = y_train_all
-
-    test_pred = fit_predict_dipls(
-        X_tr_pca, y_fit, X_te_pca,
-        n_components=best_n_comp, dipls_lambda=best_lambda
-    )
+    test_pred = fit_predict_dipls(X_tr_pp, y_fit, X_te_pp,
+                                  n_components=best_n_comp, dipls_lambda=best_lambda)
     if best_y_tf == "sqrt":
         test_pred = np.clip(test_pred, 0, None) ** 2
 
-    print(f"Test predictions: mean={test_pred.mean():.2f}, "
-          f"std={test_pred.std():.2f}, "
-          f"min={test_pred.min():.2f}, max={test_pred.max():.2f}")
+    sys.stdout.write(f"Test predictions: mean={test_pred.mean():.2f}, "
+                    f"std={test_pred.std():.2f}, "
+                    f"min={test_pred.min():.2f}, max={test_pred.max():.2f}\n")
 
     sample_submit = pd.read_csv(DATA_DIR / "sample_submit.csv", header=None)
     submit = sample_submit.copy()
     submit.iloc[:, 1] = test_pred
     submit_path = OUTPUT_DIR / "submission_v6_dipls.csv"
     submit.to_csv(submit_path, index=False, header=False)
-    print(f"Submission saved to: {submit_path}")
-
-    # テスト予測（PCAなし）
-    print()
-    print("Test Prediction (Best Setting WITHOUT PCA)")
-    test_pred_nopca = fit_predict_dipls(
-        X_tr_pp, y_fit, X_te_pp,
-        n_components=best_n_comp, dipls_lambda=best_lambda
-    )
-    if best_y_tf == "sqrt":
-        test_pred_nopca = np.clip(test_pred_nopca, 0, None) ** 2
-
-    print(f"Test predictions (no PCA): mean={test_pred_nopca.mean():.2f}, "
-          f"std={test_pred_nopca.std():.2f}, "
-          f"min={test_pred_nopca.min():.2f}, max={test_pred_nopca.max():.2f}")
+    sys.stdout.write(f"Submission saved to: {submit_path}\n")
+    sys.stdout.flush()
 
     # アンサンブル
-    print()
-    print("=" * 70)
-    print("Ensemble: di-PLS Top-3 + Existing PLS")
-    print("=" * 70)
+    sys.stdout.write("\n" + "=" * 70 + "\n")
+    sys.stdout.write("Ensemble: di-PLS Top-3 + Existing PLS\n")
+    sys.stdout.write("=" * 70 + "\n")
+    sys.stdout.flush()
 
     top3_preds = []
     for i in range(min(3, len(df_results))):
@@ -377,43 +359,39 @@ def main():
 
         xtr, xte = preprocess_pair(X_train_all, X_test_all,
                                     groups_train_all, pp)
-        pca_i = PCA(n_components=PCA_N_COMPONENTS)
-        xtr_pca = pca_i.fit_transform(xtr)
-        xte_pca = pca_i.transform(xte)
-
         yf = np.sqrt(y_train_all) if ytf == "sqrt" else y_train_all
-        p = fit_predict_dipls(xtr_pca, yf, xte_pca, n_components=nc, dipls_lambda=lam)
+        p = fit_predict_dipls(xtr, yf, xte, n_components=nc, dipls_lambda=lam)
         if ytf == "sqrt":
             p = np.clip(p, 0, None) ** 2
         top3_preds.append(p)
-        print(f"  Top-{i+1}: preproc={pp}, y_tf={ytf}, n_comp={nc}, "
-              f"lambda={lam}, RMSE={row['rmse']:.4f}")
+        sys.stdout.write(f"  Top-{i+1}: preproc={pp}, y_tf={ytf}, n_comp={nc}, "
+                        f"lambda={lam}, RMSE={row['rmse']:.4f}\n")
 
     existing_pls_path = OUTPUT_DIR / "submission_v5.csv"
     ensemble_preds = top3_preds.copy()
-
     if existing_pls_path.exists():
         df_v5 = pd.read_csv(existing_pls_path, header=None)
         pls_pred = df_v5.iloc[:, 1].values
         ensemble_preds.append(pls_pred)
-        print(f"  Existing PLS (v5): loaded {len(pls_pred)} predictions")
+        sys.stdout.write(f"  Existing PLS (v5): loaded {len(pls_pred)} predictions\n")
 
     ensemble_pred = np.mean(ensemble_preds, axis=0)
-    print(f"\nEnsemble ({len(ensemble_preds)} models): "
-          f"mean={ensemble_pred.mean():.2f}, "
-          f"std={ensemble_pred.std():.2f}")
+    sys.stdout.write(f"\nEnsemble ({len(ensemble_preds)} models): "
+                    f"mean={ensemble_pred.mean():.2f}, "
+                    f"std={ensemble_pred.std():.2f}\n")
 
     submit_ens = sample_submit.copy()
     submit_ens.iloc[:, 1] = ensemble_pred
     ens_path = OUTPUT_DIR / "submission_v6_dipls_ensemble.csv"
     submit_ens.to_csv(ens_path, index=False, header=False)
-    print(f"Ensemble submission saved to: {ens_path}")
+    sys.stdout.write(f"Ensemble submission saved to: {ens_path}\n")
+    sys.stdout.flush()
 
-    # LOSO-CVでのアンサンブル評価
-    print()
-    print("=" * 70)
-    print("LOSO-CV Ensemble Evaluation")
-    print("=" * 70)
+    # LOSO-CVアンサンブル評価
+    sys.stdout.write("\n" + "=" * 70 + "\n")
+    sys.stdout.write("LOSO-CV Ensemble Evaluation\n")
+    sys.stdout.write("=" * 70 + "\n")
+    sys.stdout.flush()
 
     X_raw = df_train[spectral_cols].values
     y = df_train["含水率"].values
@@ -423,7 +401,9 @@ def main():
     n_top = min(3, len(df_results))
     top_cv_preds = [np.full(len(y), np.nan) for _ in range(n_top)]
 
+    # アンサンブル用にもバッチ実行
     for train_idx, test_idx in logo.split(X_raw, y, groups):
+        species = groups[test_idx][0]
         X_train_raw = X_raw[train_idx]
         X_test_raw = X_raw[test_idx]
         y_train = y[train_idx]
@@ -438,27 +418,26 @@ def main():
 
             xtr, xte = preprocess_pair(X_train_raw, X_test_raw,
                                         groups_train, pp)
-            pca_m = PCA(n_components=PCA_N_COMPONENTS)
-            xtr_pca = pca_m.fit_transform(xtr)
-            xte_pca = pca_m.transform(xte)
-
             yf = np.sqrt(y_train) if ytf == "sqrt" else y_train
-            p = fit_predict_dipls(xtr_pca, yf, xte_pca, n_components=nc, dipls_lambda=lam)
+            p = fit_predict_dipls(xtr, yf, xte, n_components=nc, dipls_lambda=lam)
             if ytf == "sqrt":
                 p = np.clip(p, 0, None) ** 2
             top_cv_preds[model_idx][test_idx] = p
 
+        sys.stdout.write(f"  Ensemble fold ({species}) done\n")
+        sys.stdout.flush()
+
     ens_cv_pred = np.nanmean(top_cv_preds, axis=0)
     ens_cv_rmse = float(np.sqrt(np.nanmean((ens_cv_pred - y) ** 2)))
-    print(f"di-PLS Top-3 Ensemble LOSO-CV RMSE: {ens_cv_rmse:.4f}")
+    sys.stdout.write(f"\ndi-PLS Top-3 Ensemble LOSO-CV RMSE: {ens_cv_rmse:.4f}\n")
 
     for train_idx, test_idx in logo.split(X_raw, y, groups):
         species = groups[test_idx][0]
         fold_rmse = float(np.sqrt(np.mean((ens_cv_pred[test_idx] - y[test_idx]) ** 2)))
-        print(f"  {species}: RMSE={fold_rmse:.4f}")
+        sys.stdout.write(f"  {species}: RMSE={fold_rmse:.4f}\n")
 
-    print()
-    print("Done!")
+    sys.stdout.write("\nDone!\n")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":

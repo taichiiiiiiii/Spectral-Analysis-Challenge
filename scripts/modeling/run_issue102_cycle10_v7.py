@@ -243,21 +243,21 @@ MODEL_CFGS = [
      "tf": "sqrt", "fs": "siPLS(30,3)", "type": "pls", "group": "A"},
 
     # --- グループB: ドメイン適応モデル ---
-    # B1: TCA(linear, nc=10) + Ridge + sqrt
-    {"name": "B1:TCA_linear+Ridge+sqrt", "pp": "EPO(1)", "nc": 10,
-     "kernel": "linear", "alpha": 1.0, "tf": "sqrt", "type": "tca", "group": "B"},
-    # B2: TCA(rbf, nc=5) + Ridge + sqrt
-    {"name": "B2:TCA_rbf+Ridge+sqrt", "pp": "EPO(1)", "nc": 5,
-     "kernel": "rbf", "alpha": 1.0, "tf": "sqrt", "type": "tca", "group": "B"},
-    # B3: di-PLS(lambda=1.0, nc=4) + sqrt
-    {"name": "B3:diPLS_l1+sqrt", "pp": "EPO(1)", "nc": 4,
-     "dipls_lambda": 1.0, "tf": "sqrt", "type": "dipls", "group": "B"},
-    # B4: di-PLS(lambda=10.0, nc=3) + raw
-    {"name": "B4:diPLS_l10+raw", "pp": "EPO(1)", "nc": 3,
-     "dipls_lambda": 10.0, "tf": "raw", "type": "dipls", "group": "B"},
-    # B5: SubspaceAlignment(nc=10) + Ridge + sqrt
+    # B1: di-PLS(lambda=1.0, nc=4) + EPO + sqrt
+    {"name": "B1:diPLS_l1+EPO+sqrt", "pp": "EPO(1)", "nc": 4,
+     "dipls_lambda": 1.0, "n_pca": 30, "tf": "sqrt", "type": "dipls", "group": "B"},
+    # B2: di-PLS(lambda=10.0, nc=3) + EPO + raw
+    {"name": "B2:diPLS_l10+EPO+raw", "pp": "EPO(1)", "nc": 3,
+     "dipls_lambda": 10.0, "n_pca": 30, "tf": "raw", "type": "dipls", "group": "B"},
+    # B3: di-PLS(lambda=1.0, nc=4) + SNV + sqrt
+    {"name": "B3:diPLS_l1+SNV+sqrt", "pp": "SNV", "nc": 4,
+     "dipls_lambda": 1.0, "n_pca": 30, "tf": "sqrt", "type": "dipls", "group": "B"},
+    # B4: di-PLS(lambda=5.0, nc=3) + SNV + sqrt
+    {"name": "B4:diPLS_l5+SNV+sqrt", "pp": "SNV", "nc": 3,
+     "dipls_lambda": 5.0, "n_pca": 30, "tf": "sqrt", "type": "dipls", "group": "B"},
+    # B5: SubspaceAlignment(nc=10) + Ridge + sqrt (n_pca=20 for speed)
     {"name": "B5:SA+Ridge+sqrt", "pp": "EPO(1)", "nc": 10,
-     "alpha": 1.0, "tf": "sqrt", "type": "sa", "group": "B"},
+     "alpha": 1.0, "n_pca": 20, "tf": "sqrt", "type": "sa", "group": "B"},
 
     # --- グループC: ロバストモデル ---
     # C1: EPO(1) + PLS(4) + Huber + sqrt
