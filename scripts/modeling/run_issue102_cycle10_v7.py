@@ -27,6 +27,7 @@ import time
 from scipy.optimize import minimize
 
 from sklearn.cross_decomposition import PLSRegression
+from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge, HuberRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import LeaveOneGroupOut
@@ -129,15 +130,26 @@ def predict_pls(X_tr_raw, X_te_raw, y_train, groups_train, cfg):
 # グループB: ドメイン適応モデル
 # ============================================================
 
+def _pca_reduce(X_tr, X_te, n_pca=50):
+    """PCAで次元削減してからドメイン適応に渡す（高速化）。"""
+    pca = PCA(n_components=min(n_pca, X_tr.shape[1], X_tr.shape[0]))
+    X_tr_r = pca.fit_transform(X_tr)
+    X_te_r = pca.transform(X_te)
+    return X_tr_r, X_te_r
+
+
 def predict_tca_ridge(X_tr_raw, X_te_raw, y_train, groups_train, cfg):
-    """TCA + Ridge回帰の予測。"""
+    """TCA + Ridge回帰の予測（PCA前処理で高速化）。"""
     X_tr, X_te = preprocess(X_tr_raw, X_te_raw, groups_train, cfg["pp"])
     kernel = cfg.get("kernel", "linear")
     nc = cfg.get("nc", 10)
     alpha = cfg.get("alpha", 1.0)
+    n_pca = cfg.get("n_pca", 50)
     y_fit = apply_target_transform(y_train, cfg["tf"])
 
-    Z_tr, Z_te = tca_transform(X_tr, X_te, n_components=nc, kernel=kernel)
+    # PCAで次元削減してからTCA適用（高速化）
+    X_tr_r, X_te_r = _pca_reduce(X_tr, X_te, n_pca=n_pca)
+    Z_tr, Z_te = tca_transform(X_tr_r, X_te_r, n_components=nc, kernel=kernel)
     ridge = Ridge(alpha=alpha)
     ridge.fit(Z_tr, y_fit)
     pred = ridge.predict(Z_te)
@@ -145,25 +157,31 @@ def predict_tca_ridge(X_tr_raw, X_te_raw, y_train, groups_train, cfg):
 
 
 def predict_dipls(X_tr_raw, X_te_raw, y_train, groups_train, cfg):
-    """di-PLS予測。"""
+    """di-PLS予測（PCA前処理で高速化）。"""
     X_tr, X_te = preprocess(X_tr_raw, X_te_raw, groups_train, cfg["pp"])
     nc = cfg.get("nc", 4)
     dipls_lambda = cfg.get("dipls_lambda", 1.0)
+    n_pca = cfg.get("n_pca", 50)
     y_fit = apply_target_transform(y_train, cfg["tf"])
 
-    pred = fit_predict_dipls(X_tr, y_fit, X_te,
+    # PCAで次元削減してからdi-PLS適用（高速化）
+    X_tr_r, X_te_r = _pca_reduce(X_tr, X_te, n_pca=n_pca)
+    pred = fit_predict_dipls(X_tr_r, y_fit, X_te_r,
                              n_components=nc, dipls_lambda=dipls_lambda)
     return inverse_target_transform(pred, cfg["tf"])
 
 
 def predict_sa_ridge(X_tr_raw, X_te_raw, y_train, groups_train, cfg):
-    """SubspaceAlignment + Ridge回帰の予測。"""
+    """SubspaceAlignment + Ridge回帰の予測（PCA前処理で高速化）。"""
     X_tr, X_te = preprocess(X_tr_raw, X_te_raw, groups_train, cfg["pp"])
     nc = cfg.get("nc", 10)
     alpha = cfg.get("alpha", 1.0)
+    n_pca = cfg.get("n_pca", 50)
     y_fit = apply_target_transform(y_train, cfg["tf"])
 
-    Z_tr, Z_te = subspace_align(X_tr, X_te, n_components=nc)
+    # PCAで次元削減してからSA適用（高速化）
+    X_tr_r, X_te_r = _pca_reduce(X_tr, X_te, n_pca=n_pca)
+    Z_tr, Z_te = subspace_align(X_tr_r, X_te_r, n_components=nc)
     ridge = Ridge(alpha=alpha)
     ridge.fit(Z_tr, y_fit)
     pred = ridge.predict(Z_te)
