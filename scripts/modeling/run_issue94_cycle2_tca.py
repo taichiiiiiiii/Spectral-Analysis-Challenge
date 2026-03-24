@@ -3,7 +3,10 @@
 仮説: TCA変換後の特徴空間でPLS/Ridge/Huber回帰を行えば、
 train-test間の分布差が縮小し、LBスコアが改善する。
 
-高速化: サブサンプリングTCA + PCA次元削減でカーネル行列を小さくする。
+高速化戦略:
+- 前処理+PCA結果をfold×前処理ごとにキャッシュ
+- サブサンプリングでeighの行列サイズを~70に削減
+- eigh(69×69)≈0.1秒、PCA(1300×1555)≈20秒をキャッシュで1回に
 """
 import sys
 from pathlib import Path
@@ -19,7 +22,7 @@ warnings.filterwarnings("ignore")
 
 from scipy.linalg import eigh
 from sklearn.metrics.pairwise import rbf_kernel, linear_kernel
-from sklearn.decomposition import PCA
+from sklearn.decomposition import TruncatedSVD
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.linear_model import Ridge, HuberRegressor
 from sklearn.model_selection import LeaveOneGroupOut
@@ -32,10 +35,9 @@ DATA_DIR = Path(__file__).resolve().parents[2] / "Input_data"
 OUT_DIR = Path(__file__).resolve().parents[2] / "outputs" / "modeling"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# サブサンプリング設定
-SUBSAMPLE_PER_GROUP = 3  # 各樹種3サンプル（~39 source）
-MAX_SUBSAMPLE_TARGET = 30  # target最大30サンプル
-PCA_DIM = 30  # PCA次元削減（カーネル計算高速化用）
+SUBSAMPLE_PER_GROUP = 3
+MAX_SUBSAMPLE_TARGET = 30
+PCA_DIM = 30
 
 
 def rmse(a, b):
@@ -43,7 +45,6 @@ def rmse(a, b):
 
 
 def subsample_by_group(n_samples, groups, n_per_group=SUBSAMPLE_PER_GROUP, seed=42):
-    """各グループから代表サンプルをサブサンプリング"""
     rng = np.random.RandomState(seed)
     indices = []
     for g in np.unique(groups):
@@ -54,24 +55,24 @@ def subsample_by_group(n_samples, groups, n_per_group=SUBSAMPLE_PER_GROUP, seed=
     return np.array(sorted(indices))
 
 
-def tca_transform_fast(X_source, X_target, n_components=10, kernel="rbf",
-                       gamma=None, mu=1.0, source_groups=None, pca_dim=PCA_DIM):
-    """高速TCA: PCA次元削減 + サブサンプリング → 固有値問題 → 全データ射影"""
-    n_s = len(X_source)
-    n_t = len(X_target)
+def pca_reduce(X_tr, X_te, n_components=PCA_DIM):
+    """PCA次元削減。trainでfitしtestはtransformのみ。"""
+    nc = min(n_components, X_tr.shape[1], X_tr.shape[0])
+    svd = TruncatedSVD(n_components=nc, random_state=42)
+    X_tr_pca = svd.fit_transform(X_tr)
+    X_te_pca = svd.transform(X_te)
+    return X_tr_pca, X_te_pca
 
-    # PCA次元削減（全データで。TCAはラベルなし設定なのでOK）
-    X_all = np.vstack([X_source, X_target])
-    actual_pca_dim = min(pca_dim, X_all.shape[1], X_all.shape[0])
-    pca = PCA(n_components=actual_pca_dim)
-    X_all_pca = pca.fit_transform(X_all)
-    X_s_pca = X_all_pca[:n_s]
-    X_t_pca = X_all_pca[n_s:]
+
+def tca_on_reduced(X_s_pca, X_t_pca, n_components=10, kernel="rbf",
+                   gamma=None, mu=1.0, source_groups=None):
+    """PCA済みデータに対するサブサンプリングTCA。"""
+    n_s = len(X_s_pca)
+    n_t = len(X_t_pca)
 
     # サブサンプリング
     if source_groups is not None and n_s > 50:
-        sub_s_idx = subsample_by_group(n_s, source_groups,
-                                       n_per_group=SUBSAMPLE_PER_GROUP)
+        sub_s_idx = subsample_by_group(n_s, source_groups)
     else:
         sub_s_idx = np.arange(n_s)
 
@@ -89,7 +90,7 @@ def tca_transform_fast(X_source, X_target, n_components=10, kernel="rbf",
 
     X_sub_all = np.vstack([X_sub_s, X_sub_t])
 
-    # カーネル行列（サブサンプル間）
+    # カーネル行列
     if kernel == "rbf":
         if gamma is None:
             gamma = 1.0 / X_sub_all.shape[1]
@@ -106,10 +107,8 @@ def tca_transform_fast(X_source, X_target, n_components=10, kernel="rbf",
     L[:n_sub_s, n_sub_s:] = -1.0 / (n_sub_s * n_sub_t)
     L[n_sub_s:, :n_sub_s] = -1.0 / (n_sub_s * n_sub_t)
 
-    # センタリング行列
     H = np.eye(n_sub) - np.ones((n_sub, n_sub)) / n_sub
 
-    # 一般化固有値問題
     A = K_sub @ L @ K_sub + mu * np.eye(n_sub)
     B = K_sub @ H @ K_sub
     B = (B + B.T) / 2
@@ -122,21 +121,17 @@ def tca_transform_fast(X_source, X_target, n_components=10, kernel="rbf",
     W = eigenvectors[:, :nc]
 
     # 全データのカーネル行列（全データ vs サブサンプル）
+    X_all_pca = np.vstack([X_s_pca, X_t_pca])
     if kernel == "rbf":
         K_full = rbf_kernel(X_all_pca, X_sub_all, gamma=gamma)
     else:
         K_full = linear_kernel(X_all_pca, X_sub_all)
 
-    # 射影
     Z = K_full @ W
-    Z_source = Z[:n_s]
-    Z_target = Z[n_s:]
-
-    return Z_source, Z_target
+    return Z[:n_s], Z[n_s:]
 
 
 def preprocess(X_tr, X_te, groups_tr, method):
-    """前処理を適用する。"""
     if method == "raw":
         return X_tr.copy(), X_te.copy()
     elif method == "snv":
@@ -167,65 +162,10 @@ def fit_predict(model, Z_tr, y_tr, Z_te):
     return pred
 
 
-def run_loso_cv(X, y, groups, kernel, n_components, mu, pp_method, reg_name, target_transform):
-    """LOSO-CVを実行してRMSEを計算する。"""
-    logo = LeaveOneGroupOut()
-    all_pred = np.zeros_like(y, dtype=float)
-    fold_rmses = []
-    fold_species = []
-
-    for tr_idx, te_idx in logo.split(X, y, groups):
-        X_tr, X_te = X[tr_idx], X[te_idx]
-        y_tr = y[tr_idx].copy()
-        y_te = y[te_idx]
-        g_tr = groups[tr_idx]
-
-        # 前処理
-        X_tr_pp, X_te_pp = preprocess(X_tr, X_te, g_tr, pp_method)
-
-        # TCA変換
-        nc = min(n_components, len(te_idx) - 1)
-        if nc < 1:
-            nc = 1
-        try:
-            Z_tr, Z_te = tca_transform_fast(
-                X_tr_pp, X_te_pp, n_components=nc, kernel=kernel, mu=mu,
-                source_groups=g_tr
-            )
-        except Exception as e:
-            return None, None, None
-
-        # 目的変数変換
-        if target_transform == "sqrt":
-            y_tr_t = np.sqrt(y_tr)
-        else:
-            y_tr_t = y_tr
-
-        # 回帰
-        model = make_regressor(reg_name)
-        if reg_name == "pls3" and nc < 3:
-            model = PLSRegression(n_components=max(1, nc))
-
-        try:
-            pred = fit_predict(model, Z_tr, y_tr_t, Z_te)
-        except Exception:
-            return None, None, None
-
-        # 逆変換
-        if target_transform == "sqrt":
-            pred = np.clip(pred, 0, None) ** 2
-
-        all_pred[te_idx] = pred
-        fold_rmses.append(rmse(pred, y_te))
-        fold_species.append(groups[te_idx][0])
-
-    return rmse(all_pred, y), fold_rmses, fold_species
-
-
 def main():
     print("=" * 70)
     print("Issue #94 Cycle 2: TCA Domain Adaptation Pipeline")
-    print("(PCA + Subsampled TCA)")
+    print("(Cached PCA + Subsampled TCA)")
     print("=" * 70)
 
     t0 = time.time()
@@ -244,40 +184,112 @@ def main():
 
     print(f"Train: {X_train.shape}, Test: {X_test.shape}")
     print(f"Species (train): {np.unique(groups)}")
-    print(f"Config: PCA_DIM={PCA_DIM}, SUBSAMPLE={SUBSAMPLE_PER_GROUP}/group, MAX_TARGET={MAX_SUBSAMPLE_TARGET}")
     print()
 
     # ========================================
-    # Phase 1: LOSO-CV グリッドサーチ
+    # Phase 0: 前処理+PCAキャッシュ構築
     # ========================================
-    print("Phase 1: LOSO-CV Grid Search")
+    print("Phase 0: Building preprocessed PCA cache for each fold")
     print("-" * 50)
 
+    logo = LeaveOneGroupOut()
+    folds = list(logo.split(X_train, y_train, groups))
+    preprocessings = ["raw", "snv", "epo1"]
+
+    # cache[fold_idx][pp_method] = (X_tr_pca, X_te_pca, groups_tr)
+    cache = {}
+    for fi, (tr_idx, te_idx) in enumerate(folds):
+        cache[fi] = {}
+        X_tr, X_te = X_train[tr_idx], X_train[te_idx]
+        g_tr = groups[tr_idx]
+        species = groups[te_idx][0]
+
+        for pp in preprocessings:
+            X_tr_pp, X_te_pp = preprocess(X_tr, X_te, g_tr, pp)
+            X_tr_pca, X_te_pca = pca_reduce(X_tr_pp, X_te_pp, n_components=PCA_DIM)
+            cache[fi][pp] = (X_tr_pca, X_te_pca, g_tr, tr_idx, te_idx)
+
+        elapsed = time.time() - t0
+        print(f"  Fold {fi+1}/13 ({species}): {elapsed:.0f}s")
+
+    print(f"Cache built: {time.time()-t0:.0f}s")
+
+    # ========================================
+    # Phase 1: LOSO-CV グリッドサーチ（キャッシュ利用）
+    # ========================================
+    print("\nPhase 1: LOSO-CV Grid Search")
+    print("-" * 50)
+
+    kernels = ["linear", "rbf"]
+    n_components_list = [3, 5, 10, 15, 20]
+    mus = [0.01, 0.1, 1.0, 10.0]
+    regressors = ["pls3", "ridge", "huber"]
+    target_transforms = ["raw", "sqrt"]
+
     configs = []
-    for kernel in ["linear", "rbf"]:
-        for nc in [3, 5, 10, 15, 20]:
-            for mu in [0.01, 0.1, 1.0, 10.0]:
-                for pp in ["raw", "snv", "epo1"]:
-                    for reg in ["pls3", "ridge", "huber"]:
-                        for tt in ["raw", "sqrt"]:
+    for kernel in kernels:
+        for nc in n_components_list:
+            for mu in mus:
+                for pp in preprocessings:
+                    for reg in regressors:
+                        for tt in target_transforms:
                             configs.append((kernel, nc, mu, pp, reg, tt))
 
     total = len(configs)
     print(f"Total configurations: {total}")
 
     results = []
-    for i, (kernel, nc, mu, pp, reg, tt) in enumerate(configs):
-        if (i + 1) % 10 == 0:
+    for ci, (kernel, nc, mu, pp, reg, tt) in enumerate(configs):
+        if (ci + 1) % 20 == 0:
             elapsed = time.time() - t0
-            rate = elapsed / (i + 1)
-            eta = rate * (total - i - 1)
-            print(f"  [{i+1}/{total}] {elapsed:.0f}s elapsed, ETA {eta:.0f}s")
+            rate = elapsed / (ci + 1)
+            eta = rate * (total - ci - 1)
+            print(f"  [{ci+1}/{total}] {elapsed:.0f}s elapsed, ETA {eta:.0f}s")
 
-        overall, fold_rmses, fold_species = run_loso_cv(
-            X_train, y_train, groups, kernel, nc, mu, pp, reg, tt
-        )
+        all_pred = np.zeros_like(y_train, dtype=float)
+        fold_rmses = []
+        fold_species = []
+        failed = False
 
-        if overall is not None:
+        for fi in range(len(folds)):
+            X_tr_pca, X_te_pca, g_tr, tr_idx, te_idx = cache[fi][pp]
+            y_tr = y_train[tr_idx]
+            y_te = y_train[te_idx]
+
+            nc_actual = min(nc, len(te_idx) - 1)
+            if nc_actual < 1:
+                nc_actual = 1
+
+            try:
+                Z_tr, Z_te = tca_on_reduced(
+                    X_tr_pca, X_te_pca, n_components=nc_actual,
+                    kernel=kernel, mu=mu, source_groups=g_tr
+                )
+            except Exception:
+                failed = True
+                break
+
+            y_tr_t = np.sqrt(y_tr) if tt == "sqrt" else y_tr.copy()
+
+            model = make_regressor(reg)
+            if reg == "pls3" and nc_actual < 3:
+                model = PLSRegression(n_components=max(1, nc_actual))
+
+            try:
+                pred = fit_predict(model, Z_tr, y_tr_t, Z_te)
+            except Exception:
+                failed = True
+                break
+
+            if tt == "sqrt":
+                pred = np.clip(pred, 0, None) ** 2
+
+            all_pred[te_idx] = pred
+            fold_rmses.append(rmse(pred, y_te))
+            fold_species.append(groups[te_idx][0])
+
+        if not failed:
+            overall = rmse(all_pred, y_train)
             results.append({
                 "kernel": kernel, "n_components": nc, "mu": mu,
                 "preprocessing": pp, "regressor": reg, "target_transform": tt,
@@ -286,7 +298,7 @@ def main():
 
     df_results = pd.DataFrame(results).sort_values("rmse").reset_index(drop=True)
 
-    print(f"\nCompleted: {len(df_results)} valid results out of {total}")
+    print(f"\nCompleted: {len(df_results)} valid results")
     print(f"Time: {time.time()-t0:.0f}s")
     print(f"\nTop 20 configurations by LOSO-CV RMSE:")
     print("-" * 90)
@@ -320,8 +332,9 @@ def main():
     bpp, breg, btt = best["preprocessing"], best["regressor"], best["target_transform"]
 
     X_tr_pp, X_te_pp = preprocess(X_train, X_test, groups, bpp)
-    Z_tr, Z_te = tca_transform_fast(
-        X_tr_pp, X_te_pp, n_components=bnc, kernel=bk, mu=bmu, source_groups=groups
+    X_tr_pca, X_te_pca = pca_reduce(X_tr_pp, X_te_pp, n_components=PCA_DIM)
+    Z_tr, Z_te = tca_on_reduced(
+        X_tr_pca, X_te_pca, n_components=bnc, kernel=bk, mu=bmu, source_groups=groups
     )
     print(f"TCA transformed: train={Z_tr.shape}, test={Z_te.shape}")
 
@@ -344,9 +357,10 @@ def main():
     top5_preds = []
     for i, row in df_results.head(5).iterrows():
         X_tr_pp, X_te_pp = preprocess(X_train, X_test, groups, row["preprocessing"])
+        X_tr_pca, X_te_pca = pca_reduce(X_tr_pp, X_te_pp, n_components=PCA_DIM)
         nc = int(row["n_components"])
-        Z_tr, Z_te = tca_transform_fast(
-            X_tr_pp, X_te_pp, n_components=nc, kernel=row["kernel"], mu=row["mu"],
+        Z_tr, Z_te = tca_on_reduced(
+            X_tr_pca, X_te_pca, n_components=nc, kernel=row["kernel"], mu=row["mu"],
             source_groups=groups
         )
         y_f = np.sqrt(y_train) if row["target_transform"] == "sqrt" else y_train.copy()
