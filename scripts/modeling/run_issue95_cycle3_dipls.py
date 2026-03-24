@@ -462,7 +462,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import functools
-    import builtins
-    builtins.print = functools.partial(builtins.print, flush=True)
     main()
