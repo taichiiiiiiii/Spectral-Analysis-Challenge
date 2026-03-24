@@ -1,12 +1,12 @@
-"""di-PLSドメイン適応のアンサンブル統合（高速版）
+"""di-PLSドメイン適応のアンサンブル統合
 
 Issue #95 Cycle 3: di-PLSでLOSO-CVおよびテスト予測を行う。
-XtXの漸化式更新で高速化。
+ランダム射影で1555次元→50次元に削減してからdi-PLSを適用（高速化）。
 
 パラメータグリッド:
-- n_components: [3, 4, 5]
-- dipls_lambda: [0.1, 1.0, 10.0, 100.0]
-- 前処理: [raw, SNV, SG2d]
+- n_components: [2, 3, 4, 5, 6]
+- dipls_lambda: [0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0]
+- 前処理: [raw, SNV, EPO(1), SG2d]
 - 目的変数変換: [raw, sqrt]
 """
 import sys
@@ -35,6 +35,10 @@ DATA_DIR = PROJECT_ROOT / "Input_data"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+# ランダム射影設定
+RP_DIM = 50
+RP_SEED = 42
+
 
 def preprocess_pair(X_train_raw, X_test_raw, groups_train, method):
     """前処理を適用する。"""
@@ -52,34 +56,38 @@ def preprocess_pair(X_train_raw, X_test_raw, groups_train, method):
         raise ValueError(f"Unknown method: {method}")
 
 
-def nipals_dipls_batch_fast(X_s, y_s, X_t, max_components, lambda_list):
-    """複数のlambdaに対してdi-PLSをバッチ実行（XtX漸化式更新で高速化）。
+def random_projection(X_train, X_test, n_dim=RP_DIM, seed=RP_SEED):
+    """ランダム射影で次元削減する。
 
-    Returns
-    -------
-    dict of (n_comp, lam) -> predictions
+    trainの平均でセンタリングしてからガウシアンランダム射影。
+    """
+    rng = np.random.RandomState(seed)
+    p = X_train.shape[1]
+    R = rng.randn(p, n_dim) / np.sqrt(p)
+
+    # trainでセンタリング
+    mean = X_train.mean(axis=0)
+    X_tr_c = X_train - mean
+    X_te_c = X_test - mean
+
+    return X_tr_c @ R, X_te_c @ R
+
+
+def nipals_dipls_batch(X_s, y_s, X_t, max_components, lambda_list):
+    """複数のlambda/n_componentsに対してdi-PLSをバッチ実行。
+
+    50次元なので非常に高速。
     """
     n_s, p = X_s.shape
-
     x_mean = X_s.mean(axis=0)
     y_mean = y_s.mean()
-
-    # 初期XtXを1回だけ計算
-    X_sc_init = X_s - x_mean
-    X_tc_init = X_t - x_mean
-    y_c_init = y_s - y_mean
-
-    XtX_init = X_sc_init.T @ X_sc_init  # 最も重い計算、1回だけ
-    Xty_init = X_sc_init.T @ y_c_init
 
     results = {}
 
     for lam in lambda_list:
-        X_sc = X_sc_init.copy()
-        X_tc = X_tc_init.copy()
-        y_c = y_c_init.copy()
-        XtX = XtX_init.copy()
-        Xty = Xty_init.copy()
+        X_sc = X_s - x_mean
+        X_tc = X_t - x_mean
+        y_c = y_s - y_mean
 
         W = np.zeros((p, max_components))
         P_load = np.zeros((p, max_components))
@@ -89,41 +97,22 @@ def nipals_dipls_batch_fast(X_s, y_s, X_t, max_components, lambda_list):
         D = np.outer(mean_diff, mean_diff)
 
         for a in range(max_components):
+            XtX = X_sc.T @ X_sc
+            Xty = X_sc.T @ y_c
+
             A_mat = XtX + lam * D + 1e-8 * np.eye(p)
             w = np.linalg.solve(A_mat, Xty)
             w = w / (np.linalg.norm(w) + 1e-12)
 
             t = X_sc @ w
             tt = t @ t + 1e-12
-            # p_load = X_sc^T @ t / (t^T t)  using XtX is wrong since Xty is not t
-            # need X_sc^T @ t directly
-            Xt_t = XtX @ w * (t @ t) / tt  # NOT correct
-            # Actually: X_sc^T @ t = X_sc^T @ (X_sc @ w) = XtX @ w
-            Xt_t_vec = XtX @ w
-            p_l = Xt_t_vec / tt
+            p_l = X_sc.T @ t / tt
             q = y_c @ t / tt
 
             W[:, a] = w
             P_load[:, a] = p_l
             Q[a] = q
 
-            # Deflate X_sc: X_new = X_sc - outer(t, p_l)
-            # Update XtX using recurrence:
-            # X_new^T X_new = XtX - XtX @ outer(w, p_l) - outer(p_l, w) @ XtX
-            #                 + (t^T t) * outer(p_l, p_l)
-            # Since t = X_sc @ w, X_sc^T t = XtX @ w
-            XtX_w = XtX @ w  # = X_sc^T @ t
-            # X_new^T X_new = XtX - outer(XtX_w, p_l) - outer(p_l, XtX_w) + tt * outer(p_l, p_l)
-            XtX = XtX - np.outer(XtX_w, p_l) - np.outer(p_l, XtX_w) + tt * np.outer(p_l, p_l)
-
-            # Update Xty: X_new^T y_new where y_new = y_c - t*q
-            # X_new^T y_new = (X_sc - outer(t,p_l))^T (y_c - t*q)
-            # = X_sc^T y_c - X_sc^T t * q - p_l * (t^T y_c) + p_l * (t^T t) * q
-            # = Xty - XtX_w * q - p_l * (t @ y_c) + p_l * tt * q
-            # Note: t @ y_c = q * tt (from definition of q)
-            Xty = Xty - XtX_w * q - p_l * (t @ y_c) + p_l * tt * q
-
-            # Deflate X_sc and X_tc for mean_diff update
             X_sc = X_sc - np.outer(t, p_l)
             X_tc = X_tc - X_tc @ np.outer(w, p_l)
             y_c = y_c - t * q
@@ -131,7 +120,6 @@ def nipals_dipls_batch_fast(X_s, y_s, X_t, max_components, lambda_list):
             mean_diff = X_sc.mean(axis=0) - X_tc.mean(axis=0)
             D = np.outer(mean_diff, mean_diff)
 
-            # Store prediction for this n_comp
             nc = a + 1
             R = W[:, :nc] @ np.linalg.inv(P_load[:, :nc].T @ W[:, :nc] + 1e-10 * np.eye(nc))
             B = R @ Q[:nc]
@@ -168,13 +156,18 @@ def run_loso_cv_batch(df_train, spectral_cols, preproc_method, y_transform,
         y_test = y[test_idx]
         groups_train = groups[train_idx]
 
+        # 前処理
         X_tr_pp, X_te_pp = preprocess_pair(X_train_raw, X_test_raw,
                                             groups_train, preproc_method)
+
+        # ランダム射影
+        X_tr_rp, X_te_rp = random_projection(X_tr_pp, X_te_pp)
+
         y_fit = np.sqrt(y_train) if y_transform == "sqrt" else y_train
 
-        # バッチdi-PLS（高速版）
-        batch_preds = nipals_dipls_batch_fast(X_tr_pp, y_fit, X_te_pp,
-                                              max_comp, lambda_list)
+        # バッチdi-PLS
+        batch_preds = nipals_dipls_batch(X_tr_rp, y_fit, X_te_rp,
+                                          max_comp, lambda_list)
 
         for nc in n_components_list:
             for lam in lambda_list:
@@ -187,8 +180,9 @@ def run_loso_cv_batch(df_train, spectral_cols, preproc_method, y_transform,
                 fold_rmse = float(np.sqrt(np.mean((pred - y_test) ** 2)))
                 fold_rmses[(nc, lam)][species] = fold_rmse
 
-        sys.stdout.write(f"    fold {fold_count}/13 ({species}) done\n")
-        sys.stdout.flush()
+        if fold_count % 5 == 0 or fold_count == 13:
+            sys.stdout.write(f"    fold {fold_count}/13 done\n")
+            sys.stdout.flush()
 
     output = []
     for (nc, lam) in product(n_components_list, lambda_list):
@@ -210,9 +204,47 @@ def run_loso_cv_batch(df_train, spectral_cols, preproc_method, y_transform,
     return output
 
 
+def run_loso_cv_direct(df_train, spectral_cols, preproc_method, y_transform,
+                       n_components, dipls_lambda):
+    """PCAなし直接di-PLS（ベスト設定の検証用）。"""
+    X_raw = df_train[spectral_cols].values
+    y = df_train["含水率"].values
+    groups = df_train["樹種"].values
+    logo = LeaveOneGroupOut()
+
+    preds = np.full(len(y), np.nan)
+    fold_results = {}
+
+    for train_idx, test_idx in logo.split(X_raw, y, groups):
+        species = groups[test_idx][0]
+        X_train_raw = X_raw[train_idx]
+        X_test_raw = X_raw[test_idx]
+        y_train = y[train_idx].copy()
+        y_test = y[test_idx]
+        groups_train = groups[train_idx]
+
+        X_tr_pp, X_te_pp = preprocess_pair(X_train_raw, X_test_raw,
+                                            groups_train, preproc_method)
+        y_fit = np.sqrt(y_train) if y_transform == "sqrt" else y_train
+
+        pred = fit_predict_dipls(X_tr_pp, y_fit, X_te_pp,
+                                  n_components=n_components, dipls_lambda=dipls_lambda)
+        if y_transform == "sqrt":
+            pred = np.clip(pred, 0, None) ** 2
+
+        preds[test_idx] = pred
+        fold_results[species] = float(np.sqrt(np.mean((pred - y_test) ** 2)))
+        sys.stdout.write(f"    {species}: RMSE={fold_results[species]:.4f}\n")
+        sys.stdout.flush()
+
+    overall_rmse = float(np.sqrt(np.nanmean((preds - y) ** 2)))
+    return overall_rmse, fold_results
+
+
 def main():
     sys.stdout.write("=" * 70 + "\n")
-    sys.stdout.write("Issue #95 Cycle 3: di-PLS Domain Adaptation (Fast)\n")
+    sys.stdout.write("Issue #95 Cycle 3: di-PLS Domain Adaptation\n")
+    sys.stdout.write("(Random Projection + Batch di-PLS)\n")
     sys.stdout.write("=" * 70 + "\n")
     sys.stdout.flush()
 
@@ -221,22 +253,21 @@ def main():
     spectral_cols = get_spectral_columns(df_train)
 
     sys.stdout.write(f"Train: {len(df_train)} samples, Test: {len(df_test)} samples\n")
-    sys.stdout.write(f"Spectral features: {len(spectral_cols)}\n")
+    sys.stdout.write(f"Spectral features: {len(spectral_cols)} -> {RP_DIM} (random projection)\n")
     sys.stdout.write(f"Species (train): {sorted(df_train['樹種'].unique())}\n\n")
     sys.stdout.flush()
 
-    n_components_list = [3, 4, 5]
-    lambda_list = [0.1, 1.0, 10.0, 100.0]
-    preproc_list = ["raw", "SNV", "SG2d"]
+    # フルグリッド
+    n_components_list = [2, 3, 4, 5, 6]
+    lambda_list = [0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0]
+    preproc_list = ["raw", "SNV", "EPO1", "SG2d"]
     y_transform_list = ["raw", "sqrt"]
 
     total_combos = len(n_components_list) * len(lambda_list) * len(preproc_list) * len(y_transform_list)
     total_batches = len(preproc_list) * len(y_transform_list)
 
     sys.stdout.write(f"Total grid combinations: {total_combos}\n")
-    sys.stdout.write(f"Batch groups: {total_batches}\n")
-    sys.stdout.write(f"Optimization: XtX computed once per fold, "
-                     f"recurrence update for deflation\n\n")
+    sys.stdout.write(f"Batch groups: {total_batches}\n\n")
     sys.stdout.flush()
 
     all_results = []
@@ -271,9 +302,9 @@ def main():
 
     # 結果表示
     sys.stdout.write("\n" + "=" * 70 + "\n")
-    sys.stdout.write("LOSO-CV Results (Top 20)\n")
+    sys.stdout.write("LOSO-CV Results (Top 30) - Random Projection\n")
     sys.stdout.write("=" * 70 + "\n")
-    for i, row in df_results.head(20).iterrows():
+    for i, row in df_results.head(30).iterrows():
         sys.stdout.write(f"  #{i+1}: RMSE={row['rmse']:.4f} | preproc={row['preproc']}, "
                         f"y_tf={row['y_transform']}, n_comp={int(row['n_components'])}, "
                         f"lambda={row['dipls_lambda']}\n")
@@ -292,7 +323,8 @@ def main():
 
     best = df_results.iloc[0]
     sys.stdout.write("\n" + "=" * 70 + "\n")
-    sys.stdout.write(f"Best Setting: preproc={best['preproc']}, y_tf={best['y_transform']}, "
+    sys.stdout.write(f"Best Setting (RP): preproc={best['preproc']}, "
+                    f"y_tf={best['y_transform']}, "
                     f"n_comp={int(best['n_components'])}, lambda={best['dipls_lambda']}\n")
     sys.stdout.write(f"Overall RMSE: {best['rmse']:.4f}\n")
     sys.stdout.write("=" * 70 + "\n")
@@ -306,9 +338,23 @@ def main():
     sys.stdout.write(f"\nGrid results saved to: {results_path}\n")
     sys.stdout.flush()
 
-    # テスト予測
+    # ベスト設定を1555次元直接di-PLSで検証
     sys.stdout.write("\n" + "=" * 70 + "\n")
-    sys.stdout.write("Test Prediction (Best Setting)\n")
+    sys.stdout.write("Verification: Best setting with DIRECT 1555-dim di-PLS\n")
+    sys.stdout.write("=" * 70 + "\n")
+    sys.stdout.flush()
+
+    direct_rmse, direct_folds = run_loso_cv_direct(
+        df_train, spectral_cols,
+        best["preproc"], best["y_transform"],
+        int(best["n_components"]), best["dipls_lambda"]
+    )
+    sys.stdout.write(f"  Direct di-PLS RMSE: {direct_rmse:.4f}\n")
+    sys.stdout.flush()
+
+    # テスト予測（直接1555次元で）
+    sys.stdout.write("\n" + "=" * 70 + "\n")
+    sys.stdout.write("Test Prediction (Direct 1555-dim)\n")
     sys.stdout.write("=" * 70 + "\n")
     sys.stdout.flush()
 
@@ -349,6 +395,8 @@ def main():
     sys.stdout.write("=" * 70 + "\n")
     sys.stdout.flush()
 
+    # Top-3が同じ前処理なら1回のfit_predict_diplsで済むが、
+    # 異なる設定の場合は各自のfit_predict_diplsが必要
     top3_preds = []
     for i in range(min(3, len(df_results))):
         row = df_results.iloc[i]
@@ -366,6 +414,7 @@ def main():
         top3_preds.append(p)
         sys.stdout.write(f"  Top-{i+1}: preproc={pp}, y_tf={ytf}, n_comp={nc}, "
                         f"lambda={lam}, RMSE={row['rmse']:.4f}\n")
+        sys.stdout.flush()
 
     existing_pls_path = OUTPUT_DIR / "submission_v5.csv"
     ensemble_preds = top3_preds.copy()
@@ -387,9 +436,9 @@ def main():
     sys.stdout.write(f"Ensemble submission saved to: {ens_path}\n")
     sys.stdout.flush()
 
-    # LOSO-CVアンサンブル評価
+    # LOSO-CVアンサンブル評価（RP版のCV予測を使用）
     sys.stdout.write("\n" + "=" * 70 + "\n")
-    sys.stdout.write("LOSO-CV Ensemble Evaluation\n")
+    sys.stdout.write("LOSO-CV Ensemble Evaluation (RP-based selection, direct prediction)\n")
     sys.stdout.write("=" * 70 + "\n")
     sys.stdout.flush()
 
@@ -401,7 +450,6 @@ def main():
     n_top = min(3, len(df_results))
     top_cv_preds = [np.full(len(y), np.nan) for _ in range(n_top)]
 
-    # アンサンブル用にもバッチ実行
     for train_idx, test_idx in logo.split(X_raw, y, groups):
         species = groups[test_idx][0]
         X_train_raw = X_raw[train_idx]

@@ -469,6 +469,7 @@ def main():
 
     # 提出ファイル生成
     sub = pd.read_csv(DATA_DIR / "sample_submit.csv", header=None)
+    sub[1] = sub[1].astype(float)
     sub.iloc[:, 1] = test_pred
     sub_path = OUT_DIR.parent / "submission_v6_advval.csv"
     sub.to_csv(sub_path, index=False, header=False)
