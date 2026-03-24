@@ -22,14 +22,54 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import LeaveOneGroupOut
 
+from sklearn.metrics.pairwise import rbf_kernel, euclidean_distances
+
 from src.eda.data_loader import load_train, load_test, get_spectral_columns
 from src.preprocessing.issue18_snv import apply_snv
 from src.preprocessing.issue22_epo import compute_epo_projection, apply_epo
-from src.preprocessing.issue50_kmm import compute_kmm_weights
+from src.preprocessing.issue50_kmm import compute_kmm_weights as _compute_kmm_weights_orig
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "Input_data"
 OUT_DIR = Path(__file__).resolve().parents[2] / "outputs" / "modeling"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def compute_kmm_weights_fast(X_source, X_target, gamma=None, B=10.0, eps=0.1):
+    """高速KMM: L-BFGS-B + projection clipping で近似的に解く。
+
+    SLSQP版より大幅に高速（制約をbound clippingで近似）。
+    """
+    n_s = len(X_source)
+    n_t = len(X_target)
+
+    if gamma is None:
+        dists = euclidean_distances(X_source, X_target)
+        gamma = 1.0 / (np.median(dists.ravel()) ** 2 + 1e-10)
+
+    K_ss = rbf_kernel(X_source, X_source, gamma=gamma)
+    K_st = rbf_kernel(X_source, X_target, gamma=gamma)
+    kappa = K_st.mean(axis=1) * (n_s / n_t)
+    K_ss += 1e-6 * np.eye(n_s)
+
+    def objective(beta):
+        return 0.5 * beta @ K_ss @ beta - kappa @ beta
+
+    def jac(beta):
+        return K_ss @ beta - kappa
+
+    bounds = [(0, B)] * n_s
+    result = minimize(
+        objective, x0=np.ones(n_s), jac=jac,
+        method="L-BFGS-B", bounds=bounds,
+        options={"maxiter": 200, "ftol": 1e-8},
+    )
+    w = np.maximum(result.x, 0)
+    # sum制約の近似: wをスケーリングしてsum(w) ≈ n_s
+    w_sum = w.sum()
+    if w_sum > 0:
+        w = w * (n_s / w_sum)
+    w = np.clip(w, 0, B)
+    return w
 
 
 def rmse(y_true, y_pred):
@@ -66,7 +106,7 @@ def compute_kmm_for_fold(X_tr_pp, X_te_pp, pca_dim, kmm_B, kmm_gamma=None):
     pca = PCA(n_components=min(pca_dim, X_tr_pp.shape[1], X_tr_pp.shape[0]))
     X_tr_pca = pca.fit_transform(X_tr_pp)
     X_te_pca = pca.transform(X_te_pp)
-    weights = compute_kmm_weights(X_tr_pca, X_te_pca, gamma=kmm_gamma, B=kmm_B)
+    weights = compute_kmm_weights_fast(X_tr_pca, X_te_pca, gamma=kmm_gamma, B=kmm_B)
     return weights
 
 
