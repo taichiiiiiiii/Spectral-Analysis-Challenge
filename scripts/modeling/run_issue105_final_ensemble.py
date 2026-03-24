@@ -1,9 +1,7 @@
 """Issue #105: Final 18-model ensemble
 
-Best12 (12モデル) + LightGBM (3モデル) + Wavelet/Detrend (2モデル) + LWPLS (1モデル)
-= 18モデルのLOSO-CVを実行し、アンサンブル最適化→提出ファイル生成。
-
-最適化: 同一pp+fs組のfeat_selをキャッシュして高速化。
+Best12 + LightGBM(3) + Wavelet/Detrend(2) + LWPLS(1) = 18モデル
+fold-first方式: 各foldで前処理+特徴選択を一括計算→全モデル実行
 """
 import sys
 from pathlib import Path
@@ -40,86 +38,54 @@ OUT_DIR = Path(__file__).resolve().parents[2] / "outputs" / "modeling"
 SUB_DIR = Path(__file__).resolve().parents[2] / "outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-PREV_BEST = 13.40
-
 
 def rmse(y_true, y_pred):
     return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
 
 
 # ============================================================
-# 前処理 (キャッシュ付き)
+# 前処理
 # ============================================================
-_preproc_cache = {}
-
-
-def preproc(X_tr, X_te, g, name, fold_key=None):
-    """前処理を適用。キャッシュでfold間の再計算を回避。"""
-    cache_key = (name, fold_key) if fold_key is not None else None
-    if cache_key and cache_key in _preproc_cache:
-        return _preproc_cache[cache_key]
-
+def apply_preproc(X_tr, X_te, g, name):
     if name == "SNV":
-        result = apply_snv(X_tr), apply_snv(X_te)
+        return apply_snv(X_tr), apply_snv(X_te)
     elif name == "EPO(1)":
         P = compute_epo_projection(X_tr, g, n_components=1)
-        result = apply_epo(X_tr, P), apply_epo(X_te, P)
+        return apply_epo(X_tr, P), apply_epo(X_te, P)
     elif name == "SNV+AsLS(1e6)":
-        result = apply_asls(apply_snv(X_tr), lam=1e6), apply_asls(apply_snv(X_te), lam=1e6)
+        return apply_asls(apply_snv(X_tr), lam=1e6), apply_asls(apply_snv(X_te), lam=1e6)
     elif name == "PMSC":
         ref = compute_msc_reference(X_tr)
-        result = apply_piecewise_msc(X_tr, ref, 3), apply_piecewise_msc(X_te, ref, 3)
+        return apply_piecewise_msc(X_tr, ref, 3), apply_piecewise_msc(X_te, ref, 3)
     elif name == "SG2d+EPO(1)":
         xs = apply_savgol(X_tr, deriv=2, window_length=7)
         xst = apply_savgol(X_te, deriv=2, window_length=7)
         P = compute_epo_projection(xs, g, n_components=1)
-        result = apply_epo(xs, P), apply_epo(xst, P)
+        return apply_epo(xs, P), apply_epo(xst, P)
     elif name == "SNV+SG2d":
-        result = (apply_savgol(apply_snv(X_tr), deriv=2, window_length=7),
-                  apply_savgol(apply_snv(X_te), deriv=2, window_length=7))
+        return (apply_savgol(apply_snv(X_tr), deriv=2, window_length=7),
+                apply_savgol(apply_snv(X_te), deriv=2, window_length=7))
     elif name == "Wavelet":
-        result = wavelet_denoise(X_tr), wavelet_denoise(X_te)
+        return wavelet_denoise(X_tr), wavelet_denoise(X_te)
     elif name == "Detrend":
-        result = apply_detrending(X_tr), apply_detrending(X_te)
-    else:
-        result = X_tr.copy(), X_te.copy()
-
-    if cache_key:
-        _preproc_cache[cache_key] = result
-    return result
+        return apply_detrending(X_tr), apply_detrending(X_te)
+    return X_tr.copy(), X_te.copy()
 
 
-# ============================================================
-# 特徴選択 (キャッシュ付き)
-# ============================================================
-_fs_cache = {}
-
-
-def feat_sel(X_tr, X_te, y, name, cache_key=None):
+def apply_feat_sel(X_tr, X_te, y, name):
     if not name:
-        return X_tr, X_te
-    full_key = (name, cache_key) if cache_key else None
-    if full_key and full_key in _fs_cache:
-        selected = _fs_cache[full_key]
-        return X_tr[:, selected], X_te[:, selected]
-
+        return X_tr, X_te, None
     if name.startswith("siPLS"):
         p = name.replace("siPLS(", "").rstrip(")").split(",")
-        X_tr_sel, X_te_sel, sel = sipls_select(
-            X_tr, y, X_te, n_intervals=int(p[0]), n_components=3, n_combine=int(p[1])
-        )
-        if full_key:
-            _fs_cache[full_key] = sel
-        return X_tr_sel, X_te_sel
+        Xtr_s, Xte_s, sel = sipls_select(
+            X_tr, y, X_te, n_intervals=int(p[0]), n_components=3, n_combine=int(p[1]))
+        return Xtr_s, Xte_s, sel
     elif name.startswith("iPLS"):
         ni = int(name.replace("iPLS(", "").rstrip(")"))
-        X_tr_sel, X_te_sel, sel = ipls_select(
-            X_tr, y, X_te, n_intervals=ni, n_components=3, n_best=1
-        )
-        if full_key:
-            _fs_cache[full_key] = sel
-        return X_tr_sel, X_te_sel
-    return X_tr, X_te
+        Xtr_s, Xte_s, sel = ipls_select(
+            X_tr, y, X_te, n_intervals=ni, n_components=3, n_best=1)
+        return Xtr_s, Xte_s, sel
+    return X_tr, X_te, None
 
 
 # ============================================================
@@ -186,7 +152,6 @@ def pred_lgbm(Xtr, Xte, y, nc, tf):
 
 
 def pred_lwpls(Xtr, Xte, y, nc, tf, k=500):
-    """LWPLS on PLS score space for speed."""
     Ttr, Tte, _, yf = get_pls_scores(Xtr, Xte, y, nc, tf)
     nc_lw = max(1, min(nc, Ttr.shape[1] - 1))
     pred = lwpls_predict(Ttr, yf, Tte, n_components=nc_lw, k=min(k, len(yf)))
@@ -194,12 +159,9 @@ def pred_lwpls(Xtr, Xte, y, nc, tf, k=500):
 
 
 # ============================================================
-# モデル実行ディスパッチ
+# モデル実行（前処理済みデータを受け取る）
 # ============================================================
-def run_model(X_tr, X_te, y, g, cfg, fold_key=None):
-    Xtr, Xte = preproc(X_tr, X_te, g, cfg["pp"], fold_key=fold_key)
-    fs_cache_key = (cfg["pp"], fold_key) if fold_key is not None else None
-    Xtr, Xte = feat_sel(Xtr, Xte, y, cfg.get("fs"), cache_key=fs_cache_key)
+def run_model_on_prepared(Xtr, Xte, y, cfg):
     t = cfg["type"]
     if t == "pls":
         return pred_pls(Xtr, Xte, y, cfg.get("nc", 4), cfg["tf"])
@@ -237,9 +199,9 @@ def get_model_configs():
         {"name": "Gnew1:EPO+GBR150+raw", "pp": "EPO(1)", "nc": 4, "tf": "raw", "ne": 150, "lr": 0.08, "type": "gbr"},
         {"name": "N2:SNV+SG2d+GBR+raw", "pp": "SNV+SG2d", "nc": 4, "tf": "raw", "type": "gbr"},
         # LightGBM 3モデル
-        {"name": "LGB1:SNV+AsLS+siPLS+PLS5+sqrt", "pp": "SNV+AsLS(1e6)", "nc": 5, "tf": "sqrt", "fs": "siPLS(30,3)", "type": "lgbm"},
-        {"name": "LGB2:SNV+AsLS+siPLS+PLS4+sqrt", "pp": "SNV+AsLS(1e6)", "nc": 4, "tf": "sqrt", "fs": "siPLS(30,3)", "type": "lgbm"},
-        {"name": "LGB3:EPO+PLS6+raw", "pp": "EPO(1)", "nc": 6, "tf": "raw", "type": "lgbm"},
+        {"name": "LGBM1:SNV+AsLS+siPLS+PLS5+sqrt", "pp": "SNV+AsLS(1e6)", "nc": 5, "tf": "sqrt", "fs": "siPLS(30,3)", "type": "lgbm"},
+        {"name": "LGBM2:SNV+AsLS+siPLS+PLS4+sqrt", "pp": "SNV+AsLS(1e6)", "nc": 4, "tf": "sqrt", "fs": "siPLS(30,3)", "type": "lgbm"},
+        {"name": "LGBM3:EPO+PLS6+raw", "pp": "EPO(1)", "nc": 6, "tf": "raw", "type": "lgbm"},
         # Wavelet/Detrend 2モデル
         {"name": "Wavelet+PLS4+sqrt", "pp": "Wavelet", "nc": 4, "tf": "sqrt", "type": "pls"},
         {"name": "Detrend+PLS4+sqrt", "pp": "Detrend", "nc": 4, "tf": "sqrt", "type": "pls"},
@@ -256,7 +218,8 @@ def evaluate(all_preds, folds, y, idx, w=None):
     for fi, (_, te) in enumerate(folds):
         preds = [all_preds[m][fi] for m in idx]
         if w is not None:
-            wn = np.array(w); wn = wn / wn.sum()
+            wn = np.array(w)
+            wn = wn / wn.sum()
             ens = sum(wi * p for wi, p in zip(wn, preds))
         else:
             ens = np.mean(preds, axis=0)
@@ -264,7 +227,7 @@ def evaluate(all_preds, folds, y, idx, w=None):
     return np.mean(fold_rmses), fold_rmses
 
 
-def opt_weights(all_preds, folds, y, idx, n_restarts=30):
+def opt_weights(all_preds, folds, y, idx, n_restarts=20):
     nn = len(idx)
     def obj(w):
         wn = np.abs(w) / np.sum(np.abs(w))
@@ -281,28 +244,69 @@ def opt_weights(all_preds, folds, y, idx, n_restarts=30):
 
 
 # ============================================================
-# テストデータ予測
+# fold-first方式でLOSO-CV実行
 # ============================================================
-def predict_test(X_train, y_train, g_train, X_test, cfg):
-    Xtr, Xte = preproc(X_train, X_test, g_train, cfg["pp"], fold_key="test")
-    Xtr, Xte = feat_sel(Xtr, Xte, y_train, cfg.get("fs"),
-                         cache_key=(cfg["pp"], "test"))
-    t = cfg["type"]
-    if t == "pls":
-        return pred_pls(Xtr, Xte, y_train, cfg.get("nc", 4), cfg["tf"])
-    elif t == "gbr":
-        return pred_gbr(Xtr, Xte, y_train, cfg.get("nc", 4), cfg["tf"],
-                         cfg.get("ne", 200), cfg.get("md", 3), cfg.get("lr", 0.05))
-    elif t == "huber":
-        return pred_huber(Xtr, Xte, y_train, cfg.get("nc", 4), cfg["tf"],
-                          cfg.get("eps", 1.35))
-    elif t == "lgbm":
-        return pred_lgbm(Xtr, Xte, y_train, cfg.get("nc", 4), cfg["tf"])
-    elif t == "lwpls":
-        return pred_lwpls(Xtr, Xte, y_train, cfg.get("nc", 4), cfg["tf"],
-                           cfg.get("k", 500))
-    else:
-        raise ValueError(f"Unknown: {t}")
+def run_loso_fold_first(X, y, g, folds, cfgs):
+    """各foldで前処理+特徴選択をキャッシュし、全モデルを実行。"""
+    n = len(cfgs)
+    n_folds = len(folds)
+    all_preds = [[] for _ in range(n)]
+
+    # ユニークな(pp, fs)ペアを抽出
+    unique_pp_fs = set()
+    for cfg in cfgs:
+        unique_pp_fs.add((cfg["pp"], cfg.get("fs", None)))
+
+    for fi, (tr, te) in enumerate(folds):
+        t_fold = time.time()
+        X_tr, X_te, y_tr, g_tr = X[tr], X[te], y[tr], g[tr]
+
+        # 前処理キャッシュ (このfold内)
+        pp_cache = {}
+        for pp_name in set(cfg["pp"] for cfg in cfgs):
+            pp_cache[pp_name] = apply_preproc(X_tr, X_te, g_tr, pp_name)
+
+        # 特徴選択キャッシュ (このfold内)
+        fs_cache = {}
+        for pp_name, fs_name in unique_pp_fs:
+            if fs_name is None:
+                continue
+            Xtr_pp, Xte_pp = pp_cache[pp_name]
+            _, _, sel = apply_feat_sel(Xtr_pp, Xte_pp, y_tr, fs_name)
+            fs_cache[(pp_name, fs_name)] = sel
+
+        # 全モデル実行
+        for i, cfg in enumerate(cfgs):
+            try:
+                pp_name = cfg["pp"]
+                fs_name = cfg.get("fs", None)
+                Xtr_pp, Xte_pp = pp_cache[pp_name]
+
+                if fs_name and (pp_name, fs_name) in fs_cache:
+                    sel = fs_cache[(pp_name, fs_name)]
+                    if sel is not None:
+                        Xtr_fs = Xtr_pp[:, sel]
+                        Xte_fs = Xte_pp[:, sel]
+                    else:
+                        Xtr_fs, Xte_fs = Xtr_pp, Xte_pp
+                else:
+                    Xtr_fs, Xte_fs = Xtr_pp, Xte_pp
+
+                pred = run_model_on_prepared(Xtr_fs, Xte_fs, y_tr, cfg)
+                all_preds[i].append(pred)
+            except Exception as e:
+                fallback = np.full(len(te), y_tr.mean())
+                all_preds[i].append(fallback)
+                print(f"  ERR {cfg['name']} fold{fi}: {e}")
+
+        # メモリ解放
+        del pp_cache, fs_cache
+
+        elapsed = time.time() - t_fold
+        sp = np.unique(g[te])[0]
+        print(f"  fold {fi+1:>2}/{n_folds} ({sp}): {elapsed:.1f}s", flush=True)
+
+    return all_preds
 
 
 # ============================================================
@@ -320,56 +324,45 @@ def main():
     species_list = [np.unique(g[te])[0] for _, te in folds]
 
     print("=" * 70)
-    print("Issue #105: Final 18-model Ensemble (cached)")
+    print("Issue #105: Final 18-model Ensemble (fold-first)")
     print("=" * 70)
 
     cfgs = get_model_configs()
     n = len(cfgs)
-    all_preds = [[] for _ in range(n)]
 
+    # ============================================================
+    # Phase 1: LOSO-CV (fold-first)
+    # ============================================================
+    print(f"\n--- Phase 1: LOSO-CV ({n}モデル x {len(folds)}folds) ---\n", flush=True)
+    all_preds = run_loso_fold_first(X, y, g, folds, cfgs)
+
+    # 個別モデルRMSE
     beisugi_fold_idx = None
     for fi, sp in enumerate(species_list):
         if sp == "ベイスギ":
             beisugi_fold_idx = fi
             break
 
-    # ============================================================
-    # Phase 1: 全モデルのLOSO-CV (fold単位でキャッシュ活用)
-    # ============================================================
-    print(f"\n--- Phase 1: 全{n}モデルのLOSO-CV ---\n", flush=True)
     indiv_rmses = []
+    print(f"\n--- 個別モデル RMSE ---")
     for i, cfg in enumerate(cfgs):
-        t1 = time.time()
-        fold_rmses = []
-        for fi, (tr, te) in enumerate(folds):
-            try:
-                pred = run_model(X[tr], X[te], y[tr], g[tr], cfg, fold_key=fi)
-                all_preds[i].append(pred)
-                fold_rmses.append(rmse(y[te], pred))
-            except Exception as e:
-                fallback = np.full(len(te), y[tr].mean())
-                all_preds[i].append(fallback)
-                fold_rmses.append(999.0)
-                print(f"  ERR {cfg['name']} fold{fi}: {e}")
-        r_mean = np.mean(fold_rmses)
+        fold_rs = [rmse(y[te], all_preds[i][fi]) for fi, (_, te) in enumerate(folds)]
+        r_mean = np.mean(fold_rs)
         indiv_rmses.append(r_mean)
-        r_bei = fold_rmses[beisugi_fold_idx] if beisugi_fold_idx is not None else 0
-        non_bei = [r for j, r in enumerate(fold_rmses) if j != beisugi_fold_idx]
-        print(f"  [{i+1:>2}/{n}] {cfg['name']}: {r_mean:.2f} "
-              f"(bei={r_bei:.1f}, 除bei={np.mean(non_bei):.2f}) [{time.time()-t1:.1f}s]",
-              flush=True)
+        r_bei = fold_rs[beisugi_fold_idx] if beisugi_fold_idx is not None else 0
+        non_bei = [r for j, r in enumerate(fold_rs) if j != beisugi_fold_idx]
+        print(f"  [{i+1:>2}/{n}] {cfg['name']}: {r_mean:.2f} (bei={r_bei:.1f}, 除bei={np.mean(non_bei):.2f})")
 
     # 個別ランキング
     indiv = sorted([(r, i) for i, r in enumerate(indiv_rmses)])
     print("\n--- 個別ランキング ---")
     for rank, (r, i) in enumerate(indiv):
-        cat = "[B12]" if i < 12 else "[LGB]" if i < 15 else "[NEW]"
-        print(f"  {rank+1:>2}. {r:.2f} | {cfgs[i]['name']} {cat}")
+        print(f"  {rank+1:>2}. {r:.2f} | {cfgs[i]['name']}")
 
     # ============================================================
-    # Phase 2: 均等平均アンサンブル
+    # Phase 2: 均等平均アンサンブル (k=10~18)
     # ============================================================
-    print(f"\n--- Phase 2: 均等平均アンサンブル ---\n", flush=True)
+    print(f"\n--- Phase 2: 均等平均アンサンブル (k=10~18) ---\n", flush=True)
     top_idx = [i for _, i in indiv]
     for k in range(10, n + 1):
         idx_k = top_idx[:k]
@@ -406,11 +399,43 @@ def main():
     X_test = df_test[sc_cols].values
     test_ids = df_test["sample number"].values
 
+    # テスト予測も同様にキャッシュ
+    unique_pp = set(cfg["pp"] for cfg in cfgs)
+    unique_pp_fs_set = set((cfg["pp"], cfg.get("fs", None)) for cfg in cfgs)
+
+    pp_cache_test = {}
+    for pp_name in unique_pp:
+        t1 = time.time()
+        pp_cache_test[pp_name] = apply_preproc(X, X_test, g, pp_name)
+        print(f"  前処理[test] {pp_name}: {time.time()-t1:.1f}s", flush=True)
+
+    fs_cache_test = {}
+    for pp_name, fs_name in unique_pp_fs_set:
+        if fs_name is None:
+            continue
+        Xtr_pp, Xte_pp = pp_cache_test[pp_name]
+        _, _, sel = apply_feat_sel(Xtr_pp, Xte_pp, y, fs_name)
+        fs_cache_test[(pp_name, fs_name)] = sel
+
     all_test_preds = []
     for i, cfg in enumerate(cfgs):
         t1 = time.time()
         try:
-            pred = predict_test(X, y, g, X_test, cfg)
+            pp_name = cfg["pp"]
+            fs_name = cfg.get("fs", None)
+            Xtr_pp, Xte_pp = pp_cache_test[pp_name]
+
+            if fs_name and (pp_name, fs_name) in fs_cache_test:
+                sel = fs_cache_test[(pp_name, fs_name)]
+                if sel is not None:
+                    Xtr_fs = Xtr_pp[:, sel]
+                    Xte_fs = Xte_pp[:, sel]
+                else:
+                    Xtr_fs, Xte_fs = Xtr_pp, Xte_pp
+            else:
+                Xtr_fs, Xte_fs = Xtr_pp, Xte_pp
+
+            pred = run_model_on_prepared(Xtr_fs, Xte_fs, y, cfg)
             all_test_preds.append(pred)
             print(f"  [{i+1:>2}/{n}] {cfg['name']}: mean={pred.mean():.2f} [{time.time()-t1:.1f}s]",
                   flush=True)
@@ -427,25 +452,16 @@ def main():
     sub_equal = pd.DataFrame({"id": test_ids, "pred": preds_equal_12})
     path_equal = SUB_DIR / "submission_v12_final_equal12.csv"
     sub_equal.to_csv(path_equal, index=False, header=False)
-    print(f"  {path_equal.name} (mean={preds_equal_12.mean():.2f})")
+    print(f"  {path_equal.name} (mean={preds_equal_12.mean():.2f}, std={preds_equal_12.std():.2f})")
 
     # 2. Best12 Nelder-Mead最適化
     wn = np.array(w_opt) / np.sum(w_opt)
     preds_opt_12 = sum(wi * all_test_preds[ci] for wi, ci in zip(wn, best_idx_12))
     preds_opt_12 = np.clip(preds_opt_12, 0, 300)
     sub_opt = pd.DataFrame({"id": test_ids, "pred": preds_opt_12})
-    path_best = SUB_DIR / "submission_v12_final_opt12.csv"
-    sub_opt.to_csv(path_best, index=False, header=False)
-    print(f"  {path_best.name} (mean={preds_opt_12.mean():.2f})")
-
-    # 3. LightGBM重視 (B12均等:LGB3均等 = 0.7:0.3)
-    b12_test = np.mean(all_test_preds[:12], axis=0)
-    lgb_test = np.mean(all_test_preds[12:15], axis=0)
-    lgbm_heavy = np.clip(0.7 * b12_test + 0.3 * lgb_test, 0, 300)
-    sub_lgbm = pd.DataFrame({"id": test_ids, "pred": lgbm_heavy})
-    path_lgbm = SUB_DIR / "submission_v12_final_blend_lgbm_heavy.csv"
-    sub_lgbm.to_csv(path_lgbm, index=False, header=False)
-    print(f"  {path_lgbm.name} (mean={lgbm_heavy.mean():.2f})")
+    path_opt = SUB_DIR / "submission_v12_final_opt12.csv"
+    sub_opt.to_csv(path_opt, index=False, header=False)
+    print(f"  {path_opt.name} (mean={preds_opt_12.mean():.2f}, std={preds_opt_12.std():.2f})")
 
     # ============================================================
     # 結果保存
@@ -468,8 +484,7 @@ def main():
     print(f"最終結果:")
     print(f"  Equal-12 LOSO-CV RMSE: {r_equal_12:.4f}")
     print(f"  Opt-12   LOSO-CV RMSE: {r_opt:.4f}")
-    print(f"  前ベスト: {PREV_BEST:.4f}")
-    print(f"  提出: {path_equal.name}, {path_best.name}, {path_lgbm.name}")
+    print(f"  提出: {path_equal.name}, {path_opt.name}")
     print(f"  総実行時間: {time.time() - t0:.0f}s")
     print(f"{'='*70}")
 
