@@ -347,10 +347,10 @@ def main():
     ]
 
     # ============================================================
-    # パラメータグリッド
+    # パラメータグリッド（高速探索）
     # ============================================================
-    iter_values = [1, 2, 3]
-    ratio_values = [0.1, 0.2, 0.3, 0.5]
+    iter_values = [1, 2]
+    ratio_values = [0.2, 0.5]
 
     results = []
     total_runs = len(final_cfgs) * len(iter_values) * len(ratio_values)

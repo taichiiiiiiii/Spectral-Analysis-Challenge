@@ -382,10 +382,10 @@ def main():
                     f"min={test_pred.min():.2f}, max={test_pred.max():.2f}\n")
 
     sample_submit = pd.read_csv(DATA_DIR / "sample_submit.csv", header=None)
-    submit = sample_submit.copy()
-    submit.iloc[:, 1] = test_pred
+    submit_ids = sample_submit.iloc[:, 0].values
+    submit_df = pd.DataFrame({0: submit_ids, 1: test_pred})
     submit_path = OUTPUT_DIR / "submission_v6_dipls.csv"
-    submit.to_csv(submit_path, index=False, header=False)
+    submit_df.to_csv(submit_path, index=False, header=False)
     sys.stdout.write(f"Submission saved to: {submit_path}\n")
     sys.stdout.flush()
 
@@ -395,8 +395,6 @@ def main():
     sys.stdout.write("=" * 70 + "\n")
     sys.stdout.flush()
 
-    # Top-3が同じ前処理なら1回のfit_predict_diplsで済むが、
-    # 異なる設定の場合は各自のfit_predict_diplsが必要
     top3_preds = []
     for i in range(min(3, len(df_results))):
         row = df_results.iloc[i]
@@ -429,10 +427,9 @@ def main():
                     f"mean={ensemble_pred.mean():.2f}, "
                     f"std={ensemble_pred.std():.2f}\n")
 
-    submit_ens = sample_submit.copy()
-    submit_ens.iloc[:, 1] = ensemble_pred
+    ens_df = pd.DataFrame({0: submit_ids, 1: ensemble_pred})
     ens_path = OUTPUT_DIR / "submission_v6_dipls_ensemble.csv"
-    submit_ens.to_csv(ens_path, index=False, header=False)
+    ens_df.to_csv(ens_path, index=False, header=False)
     sys.stdout.write(f"Ensemble submission saved to: {ens_path}\n")
     sys.stdout.flush()
 
