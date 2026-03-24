@@ -187,10 +187,10 @@ class TestKMMPipeline:
         X_tr_snv = apply_snv(self.X[tr])
         X_te_snv = apply_snv(self.X[te])
 
-        pca = PCA(n_components=50)
+        pca = PCA(n_components=10)
         X_tr_pca = pca.fit_transform(X_tr_snv)
         X_te_pca = pca.transform(X_te_snv)
-        weights = compute_kmm_weights(X_tr_pca, X_te_pca, B=10.0)
+        weights = compute_kmm_weights(X_tr_pca, X_te_pca, B=5.0)
 
         assert weights.shape == (len(tr),)
         assert np.all(weights >= 0)

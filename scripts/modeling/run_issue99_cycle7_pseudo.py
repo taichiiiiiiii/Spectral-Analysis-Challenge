@@ -155,13 +155,12 @@ def train_and_predict(X_tr, y_tr, groups_tr, X_te, cfg):
 # ============================================================
 
 ENSEMBLE_CONFIGS = [
-    {"name": "M1:EPO+PLS4+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt", "type": "pls"},
-    {"name": "M3:SNV+iPLS50+PLS4+sqrt", "pp": "SNV", "nc": 4, "tf": "sqrt",
-     "fs": "iPLS(50)", "type": "pls"},
-    {"name": "M2:SG2d+EPO+PLS3+raw", "pp": "SG2d+EPO(1)", "nc": 3, "tf": "raw",
+    # 分散計算用: 高速モデルのみ（特徴量選択なし）
+    {"name": "E1:EPO+PLS4+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt", "type": "pls"},
+    {"name": "E2:SNV+PLS4+sqrt", "pp": "SNV", "nc": 4, "tf": "sqrt", "type": "pls"},
+    {"name": "E3:SG2d+EPO+PLS3+raw", "pp": "SG2d+EPO(1)", "nc": 3, "tf": "raw",
      "type": "pls"},
-    {"name": "M5:SNV+AsLS+siPLS+PLS4+sqrt", "pp": "SNV+AsLS(1e6)", "nc": 4, "tf": "sqrt",
-     "fs": "siPLS(30,3)", "type": "pls"},
+    {"name": "E4:EPO+PLS3+sqrt", "pp": "EPO(1)", "nc": 3, "tf": "sqrt", "type": "pls"},
 ]
 
 
@@ -327,22 +326,30 @@ def main():
     ensemble_cfgs = ENSEMBLE_CONFIGS
 
     # ============================================================
-    # 最終予測用モデル構成
+    # 最終予測用モデル構成（高速: 特徴量選択なし）
     # ============================================================
     final_cfgs = [
         {"name": "EPO+PLS4+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt", "type": "pls"},
+        {"name": "SNV+PLS4+sqrt", "pp": "SNV", "nc": 4, "tf": "sqrt", "type": "pls"},
+        {"name": "SG2d+EPO+PLS3+raw", "pp": "SG2d+EPO(1)", "nc": 3, "tf": "raw",
+         "type": "pls"},
+        {"name": "EPO+PLS3+sqrt", "pp": "EPO(1)", "nc": 3, "tf": "sqrt", "type": "pls"},
+        {"name": "SNV+Huber+sqrt", "pp": "SNV", "nc": 4, "tf": "sqrt",
+         "type": "huber", "eps": 1.35},
+    ]
+
+    # 特徴量選択あり最終モデル（ベスト設定のみ後で追加評価）
+    final_cfgs_slow = [
         {"name": "SNV+iPLS50+PLS4+sqrt", "pp": "SNV", "nc": 4, "tf": "sqrt",
          "fs": "iPLS(50)", "type": "pls"},
         {"name": "SNV+AsLS+siPLS+PLS4+sqrt", "pp": "SNV+AsLS(1e6)", "nc": 4, "tf": "sqrt",
          "fs": "siPLS(30,3)", "type": "pls"},
-        {"name": "SG2d+EPO+PLS3+raw", "pp": "SG2d+EPO(1)", "nc": 3, "tf": "raw",
-         "type": "pls"},
     ]
 
     # ============================================================
     # パラメータグリッド
     # ============================================================
-    iter_values = [1, 2, 3, 5]
+    iter_values = [1, 2, 3]
     ratio_values = [0.1, 0.2, 0.3, 0.5]
 
     results = []
@@ -433,10 +440,59 @@ def main():
     # ベスト vs ベースライン
     best = df_results.iloc[0]
     best_baseline_rmse = min(b[1] for b in baseline_results)
-    print(f"\nベストPseudo: {best['mean_rmse']:.4f}")
+    print(f"\nベストPseudo (高速モデル): {best['mean_rmse']:.4f}")
     print(f"ベストベースライン: {best_baseline_rmse:.4f}")
     print(f"改善: {best_baseline_rmse - best['mean_rmse']:+.4f}")
     print(f"全体ベスト: 17.03")
+
+    # ============================================================
+    # ベスト iter/ratio で遅いモデル（iPLS/siPLS含む）も評価
+    # ============================================================
+    best_n_iter_fast = int(best["n_iterations"])
+    best_ratio_fast = float(best["confidence_ratio"])
+
+    print(f"\n{'='*70}")
+    print(f"特徴量選択ありモデル追加評価 (iter={best_n_iter_fast}, ratio={best_ratio_fast})")
+    print(f"{'='*70}")
+
+    for cfg in final_cfgs_slow:
+        # ベースライン
+        fold_rmses_bl = []
+        for f_idx, (tr_idx, te_idx) in enumerate(folds):
+            try:
+                pred = train_and_predict(
+                    X_raw[tr_idx], y[tr_idx], groups[tr_idx], X_raw[te_idx], cfg
+                )
+                fold_rmses_bl.append(rmse(y[te_idx], np.clip(pred, 0, 300)))
+            except Exception as e:
+                fold_rmses_bl.append(999.0)
+        bl_r = np.mean(fold_rmses_bl)
+
+        # Pseudo Labeling
+        t1 = time.time()
+        mean_r, mean_nb, fold_rmses_pl, _, _ = loso_cv_pseudo(
+            X_raw, y, groups,
+            n_iterations=best_n_iter_fast,
+            confidence_ratio=best_ratio_fast,
+            final_cfg=cfg,
+            ensemble_cfgs=ensemble_cfgs,
+        )
+        elapsed = time.time() - t1
+        print(f"  {cfg['name']}: baseline={bl_r:.2f} → pseudo={mean_r:.2f} "
+              f"(除ベイスギ={mean_nb:.2f}) [{elapsed:.0f}s]")
+
+        results.append({
+            "final_model": cfg["name"],
+            "n_iterations": best_n_iter_fast,
+            "confidence_ratio": best_ratio_fast,
+            "mean_rmse": mean_r,
+            "mean_rmse_excl_beisugi": mean_nb,
+            **{f"fold_{sp}": r for sp, r in zip(sp_names, fold_rmses_pl)},
+        })
+
+    # 再ソート
+    df_results = pd.DataFrame(results).sort_values("mean_rmse")
+    best = df_results.iloc[0]
 
     # ============================================================
     # ベスト設定でテスト予測（本番）

@@ -159,9 +159,12 @@ def main():
     print("Phase 1: LOSO-CV Grid Search")
     print("-" * 50)
 
+    # Phase 1a: 粗いグリッドサーチ（計算コスト削減）
+    # カーネル行列サイズ ~1400x1400 の固有値分解を毎fold行うため、
+    # まず小さいグリッドで探索し、良い領域を特定する
     kernels = ["linear", "rbf"]
-    n_components_list = [3, 5, 10, 15, 20]
-    mus = [0.01, 0.1, 1.0, 10.0]
+    n_components_list = [5, 10, 20]
+    mus = [0.1, 1.0, 10.0]
     preprocessings = ["raw", "snv", "epo1"]
     regressors = ["pls3", "ridge", "huber"]
     target_transforms = ["raw", "sqrt"]
