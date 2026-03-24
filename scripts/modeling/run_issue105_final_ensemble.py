@@ -399,6 +399,12 @@ def main():
     X_test = df_test[sc_cols].values
     test_ids = df_test["sample number"].values
 
+    # 提出ファイルバリデーション: sample_submit.csvとの行数一致確認
+    sample_sub = pd.read_csv(DATA_DIR / "sample_submit.csv", header=None)
+    assert len(test_ids) == len(sample_sub), (
+        f"テスト行数不一致: test={len(test_ids)}, sample_submit={len(sample_sub)}"
+    )
+
     # テスト予測も同様にキャッシュ
     unique_pp = set(cfg["pp"] for cfg in cfgs)
     unique_pp_fs_set = set((cfg["pp"], cfg.get("fs", None)) for cfg in cfgs)

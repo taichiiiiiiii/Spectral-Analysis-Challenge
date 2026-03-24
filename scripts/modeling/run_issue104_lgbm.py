@@ -61,7 +61,7 @@ LGBM_CONFIGS = [
 ]
 
 
-def run_lgbm_fold(Ttr, yf, Tte, seed=42):
+def run_lgbm_fold(Ttr, yf, seed=42):
     """LightGBM 1fold実行"""
     n_val = max(1, int(len(yf) * 0.15))
     idx = np.random.RandomState(seed).permutation(len(yf))
@@ -110,7 +110,7 @@ def main():
         for fi, (tr, te) in enumerate(folds):
             Xtr, Xte = preproc(X[tr], X[te], cfg["pp"])
             Ttr, Tte, _, yf = get_pls_scores(Xtr, Xte, y[tr], cfg["nc"], cfg["tf"])
-            model = run_lgbm_fold(Ttr, yf, Tte)
+            model = run_lgbm_fold(Ttr, yf)
             pred = inv_tf(model.predict(Tte), cfg["tf"])
             oof[te] = pred
             fold_rmses.append(rmse(y[te], pred))
@@ -168,7 +168,7 @@ def main():
         pls = PLSRegression(n_components=nc)
         pls.fit(Xtr, yf)
         Ttr, Tte = pls.transform(Xtr), pls.transform(Xte)
-        model = run_lgbm_fold(Ttr, yf, Tte)
+        model = run_lgbm_fold(Ttr, yf)
         pred = inv_tf(model.predict(Tte), tf)
         lgbm_test_preds.append(pred)
         print(f"  LGB test: {r['name']} mean={pred.mean():.2f}, std={pred.std():.2f}")

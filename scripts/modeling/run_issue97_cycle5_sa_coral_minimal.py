@@ -21,7 +21,7 @@ from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import LeaveOneGroupOut
 
-from src.eda.data_loader import load_train, load_test, get_spectral_columns
+from src.eda.data_loader import load_train, get_spectral_columns
 from src.preprocessing.issue18_snv import apply_snv
 from src.preprocessing.issue44_subspace_alignment import subspace_align
 
@@ -54,75 +54,14 @@ def preprocess(X_tr, X_te, pp_name):
     return X_tr.copy(), X_te.copy()
 
 
-def predict_sa(X_tr_raw, X_te_raw, y_train, cfg):
-    pp_name = cfg["pp"]
-    sa_nc = cfg["sa_nc"]
-    reg_type = cfg["reg"]
-    tf = cfg["tf"]
-    X_tr, X_te = preprocess(X_tr_raw, X_te_raw, pp_name)
-    Z_tr, Z_te = subspace_align(X_tr, X_te, n_components=sa_nc)
-    y_fit = np.sqrt(y_train) if tf == "sqrt" else y_train.copy()
-    if reg_type == "PLS":
-        nc = min(cfg.get("pls_nc", sa_nc), sa_nc - 1)
-        nc = max(1, nc)
-        pls = PLSRegression(n_components=nc)
-        pls.fit(Z_tr, y_fit)
-        pred = pls.predict(Z_te).ravel()
-    elif reg_type == "Ridge":
-        sc = StandardScaler()
-        Z_tr_s = sc.fit_transform(Z_tr)
-        Z_te_s = sc.transform(Z_te)
-        ridge = Ridge(alpha=cfg.get("alpha", 1.0))
-        ridge.fit(Z_tr_s, y_fit)
-        pred = ridge.predict(Z_te_s)
-    else:
-        raise ValueError(f"Unknown reg: {reg_type}")
-    if tf == "sqrt":
-        pred = np.clip(pred, 0, None) ** 2
-    return pred
-
-
-def predict_coral(X_tr_raw, X_te_raw, y_train, cfg):
-    pp_name = cfg["pp"]
-    pca_dim = cfg["pca_dim"]
-    reg_type = cfg["reg"]
-    tf = cfg["tf"]
-    X_tr, X_te = preprocess(X_tr_raw, X_te_raw, pp_name)
-    pca = PCA(n_components=pca_dim)
-    X_tr_pca = pca.fit_transform(X_tr)
-    X_te_pca = pca.transform(X_te)
-    X_tr_coral, X_te_coral = coral_transform(X_tr_pca, X_te_pca)
-    y_fit = np.sqrt(y_train) if tf == "sqrt" else y_train.copy()
-    if reg_type == "PLS":
-        nc = min(cfg.get("pls_nc", 4), pca_dim - 1)
-        nc = max(1, nc)
-        pls = PLSRegression(n_components=nc)
-        pls.fit(X_tr_coral, y_fit)
-        pred = pls.predict(X_te_coral).ravel()
-    elif reg_type == "Ridge":
-        sc = StandardScaler()
-        X_tr_s = sc.fit_transform(X_tr_coral)
-        X_te_s = sc.transform(X_te_coral)
-        ridge = Ridge(alpha=cfg.get("alpha", 1.0))
-        ridge.fit(X_tr_s, y_fit)
-        pred = ridge.predict(X_te_s)
-    else:
-        raise ValueError(f"Unknown reg: {reg_type}")
-    if tf == "sqrt":
-        pred = np.clip(pred, 0, None) ** 2
-    return pred
-
-
 def main():
     t0 = time.time()
     df_train = load_train(DATA_DIR)
-    df_test = load_test(DATA_DIR)
     sc = get_spectral_columns(df_train)
 
     X_raw = df_train[sc].values
     y = df_train["含水率"].values
     groups = df_train["樹種"].values
-    X_test_raw = df_test[sc].values
 
     logo = LeaveOneGroupOut()
     folds = list(logo.split(X_raw, y, groups))
@@ -196,6 +135,8 @@ def main():
             ridge = Ridge(alpha=cfg.get("alpha", 1.0))
             ridge.fit(Z_tr_s, y_fit)
             return ridge.predict(Z_te_s)
+        else:
+            raise ValueError(f"Unknown reg_type: {reg_type}")
 
     # --- SA評価 ---
     print(f"\n--- SA評価 ---\n", flush=True)
@@ -408,7 +349,7 @@ def main():
             **{f"fold_{sp}": r for sp, r in zip(sp_names, fold_rmses)},
         })
 
-    result_path = OUT_DIR / "issue97_cycle5_sa_coral_results.csv"
+    result_path = OUT_DIR / "issue97_cycle5_sa_coral_minimal_results.csv"
     pd.DataFrame(rows).to_csv(result_path, index=False)
     print(f"\n結果CSV: {result_path}")
     print(f"総実行時間: {time.time() - t0:.0f}s")

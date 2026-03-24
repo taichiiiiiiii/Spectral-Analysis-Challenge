@@ -88,13 +88,9 @@ def lwpls_predict(T_train, y_train, T_test, k=200, sigma_factor=1.0):
         weights = np.exp(-0.5 * (d_nn / sigma) ** 2)
         weights = weights / (weights.sum() + 1e-10)
 
-        sqrt_w = np.sqrt(weights)
-        T_w = T_nn * sqrt_w[:, None]
-        y_w = y_nn * sqrt_w
-
         try:
             lr = LinearRegression()
-            lr.fit(T_w, y_w)
+            lr.fit(T_nn, y_nn, sample_weight=weights)
             predictions[i] = lr.predict(T_test[i:i+1])[0]
         except Exception:
             predictions[i] = y_train.mean()
@@ -127,16 +123,21 @@ def lwpls_predict_full(X_train, y_train, X_test, T_train, T_test,
         weights = np.exp(-0.5 * (d_nn / sigma) ** 2)
         weights = weights / (weights.sum() + 1e-10)
 
+        n_comp = min(max_comp, k_actual, X_nn.shape[1])
+        n_comp = max(1, n_comp)
+
+        # PLSRegression doesn't support sample_weight, use sqrt scaling consistently
         sqrt_w = np.sqrt(weights)
         X_weighted = X_nn * sqrt_w[:, None]
         y_weighted = y_nn * sqrt_w
+        X_test_weighted = X_test[i:i+1].copy()  # no weight for single test sample
 
-        n_comp = min(max_comp, k_actual, X_nn.shape[1])
-        n_comp = max(1, n_comp)
         pls = PLSRegression(n_components=n_comp)
         try:
             pls.fit(X_weighted, y_weighted)
-            predictions[i] = pls.predict(X_test[i:i+1].copy()).ravel()[0]
+            # Apply same sqrt_w scaling convention: predict needs unweighted input
+            # since WLS via sqrt scaling: (W^{1/2}X)b = W^{1/2}y => Xb = y (same coefs)
+            predictions[i] = pls.predict(X_test_weighted).ravel()[0]
         except Exception:
             predictions[i] = y_train.mean()
 
