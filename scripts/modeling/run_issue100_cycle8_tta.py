@@ -6,8 +6,11 @@
 既存ベスト4モデル（submission_v5相当のPLSモデル）にTTAを適用:
 1. EPO(1)+PLS(4)+sqrt
 2. SG2d+EPO(1)+PLS(3)+raw
-3. SNV+AsLS+siPLS(30,3)+PLS(4)+sqrt  (nc=5も試す)
+3. SNV+AsLS+siPLS(30,3)+PLS(5)+sqrt
 4. SNV+iPLS(50)+PLS(4)+sqrt
+
+最適化: train依存の前処理（EPO projection, PLSモデル, 特徴量選択index）を
+事前にキャッシュし、TTA拡張版ごとにテスト側の前処理と予測のみ実行。
 """
 import sys
 from pathlib import Path
@@ -86,6 +89,27 @@ def fs(X_tr, X_te, y, fs_name):
     return X_tr, X_te
 
 
+def fs_get_indices(X_tr, y, fs_name):
+    """特徴量選択のインデックスのみを取得する。"""
+    if not fs_name:
+        return None
+    dummy_te = X_tr[:1]  # ダミー
+    if fs_name.startswith("siPLS"):
+        p = fs_name.replace("siPLS(", "").rstrip(")").split(",")
+        _, _, idx = sipls_select(
+            X_tr, y, dummy_te, n_intervals=int(p[0]),
+            n_components=3, n_combine=int(p[1])
+        )
+        return idx
+    elif fs_name.startswith("iPLS"):
+        n = int(fs_name.replace("iPLS(", "").rstrip(")"))
+        _, _, idx = ipls_select(
+            X_tr, y, dummy_te, n_intervals=n, n_components=3, n_best=1
+        )
+        return idx
+    return None
+
+
 # ============================================================
 # TTA: Test-Time Augmentation
 # ============================================================
@@ -103,14 +127,8 @@ def generate_augmented_spectra(X, n_aug=10, seed=42,
         生成する拡張版の数（元のスペクトルを除く）
     seed : int
         乱数シード
-    offset_std : float
-        ベースラインオフセットの標準偏差
-    slope_std : float
-        スロープ変動の標準偏差
-    scale_std : float
-        強度スケーリングの標準偏差
-    noise_std : float
-        ガウシアンノイズの標準偏差
+    offset_std, slope_std, scale_std, noise_std : float
+        各種ノイズの標準偏差
 
     Returns
     -------
@@ -122,30 +140,132 @@ def generate_augmented_spectra(X, n_aug=10, seed=42,
 
     for i in range(n_aug):
         X_aug = X.copy()
-
-        # 1. ベースラインオフセット（各サンプルにランダムな定数を加算）
+        # 1. ベースラインオフセット
         offset = rng.normal(0, offset_std, size=(X.shape[0], 1))
         X_aug += offset
-
-        # 2. スロープ変動（線形ベースライン変動）
+        # 2. スロープ変動
         slope = rng.normal(0, slope_std, size=(X.shape[0], 1))
         X_aug += slope * np.arange(X.shape[1]).reshape(1, -1)
-
-        # 3. 強度スケーリング（乗算ノイズ）
+        # 3. 強度スケーリング
         scale = rng.normal(1.0, scale_std, size=(X.shape[0], 1))
         X_aug *= scale
-
         # 4. ガウシアンノイズ
         noise = rng.normal(0, noise_std, size=X.shape)
         X_aug += noise
-
         augmented.append(X_aug)
 
     return augmented
 
 
+# ============================================================
+# 高速TTA: 前処理キャッシュ付き
+# ============================================================
+
+def pp_test_only(X_te_raw, pp_name, cache):
+    """テスト側の前処理のみ適用（train依存パラメータはcacheから取得）。"""
+    if pp_name == "SNV":
+        return apply_snv(X_te_raw)
+    elif pp_name == "EPO(1)":
+        P = cache["epo_P"]
+        return apply_epo(X_te_raw, P)
+    elif pp_name == "SNV+AsLS(1e6)":
+        return apply_asls(apply_snv(X_te_raw), lam=1e6)
+    elif pp_name == "PMSC":
+        ref = cache["msc_ref"]
+        return apply_piecewise_msc(X_te_raw, ref, 3)
+    elif pp_name == "SG2d+EPO(1)":
+        xst = apply_savgol(X_te_raw, deriv=2, window_length=7)
+        P = cache["epo_P"]
+        return apply_epo(xst, P)
+    elif pp_name == "SNV+SG2d":
+        return apply_savgol(apply_snv(X_te_raw), deriv=2, window_length=7)
+    return X_te_raw.copy()
+
+
+def build_train_cache(X_tr_raw, y_tr, g_tr, cfg):
+    """train側の前処理・特徴量選択・PLSモデルを事前計算してキャッシュする。
+
+    Returns
+    -------
+    cache : dict
+        epo_P, msc_ref, fs_idx, pls_model, tf, pp_name 等
+    """
+    pp_name = cfg["pp"]
+    cache = {"pp_name": pp_name, "tf": cfg["tf"]}
+
+    # 前処理（train側）+ train依存パラメータ
+    if pp_name == "SNV":
+        Xtr_pp = apply_snv(X_tr_raw)
+    elif pp_name == "EPO(1)":
+        P = compute_epo_projection(X_tr_raw, g_tr, n_components=1)
+        cache["epo_P"] = P
+        Xtr_pp = apply_epo(X_tr_raw, P)
+    elif pp_name == "SNV+AsLS(1e6)":
+        Xtr_pp = apply_asls(apply_snv(X_tr_raw), lam=1e6)
+    elif pp_name == "PMSC":
+        ref = compute_msc_reference(X_tr_raw)
+        cache["msc_ref"] = ref
+        Xtr_pp = apply_piecewise_msc(X_tr_raw, ref, 3)
+    elif pp_name == "SG2d+EPO(1)":
+        xs = apply_savgol(X_tr_raw, deriv=2, window_length=7)
+        P = compute_epo_projection(xs, g_tr, n_components=1)
+        cache["epo_P"] = P
+        Xtr_pp = apply_epo(xs, P)
+    elif pp_name == "SNV+SG2d":
+        Xtr_pp = apply_savgol(apply_snv(X_tr_raw), deriv=2, window_length=7)
+    else:
+        Xtr_pp = X_tr_raw.copy()
+
+    # 特徴量選択
+    fs_name = cfg.get("fs")
+    fs_idx = fs_get_indices(Xtr_pp, y_tr, fs_name)
+    cache["fs_idx"] = fs_idx
+
+    if fs_idx is not None:
+        Xtr_sel = Xtr_pp[:, fs_idx]
+    else:
+        Xtr_sel = Xtr_pp
+
+    # PLSモデル
+    nc = cfg.get("nc", 4)
+    tf = cfg["tf"]
+    nc = max(1, min(nc, Xtr_sel.shape[1] - 1))
+    yf = np.sqrt(y_tr) if tf == "sqrt" else y_tr.copy()
+
+    pls = PLSRegression(n_components=nc)
+    pls.fit(Xtr_sel, yf)
+    cache["pls_model"] = pls
+
+    return cache
+
+
+def predict_from_cache(X_te_raw, cache):
+    """キャッシュされたモデルでテストデータを予測する。"""
+    # テスト側の前処理
+    Xte_pp = pp_test_only(X_te_raw, cache["pp_name"], cache)
+
+    # 特徴量選択
+    fs_idx = cache["fs_idx"]
+    if fs_idx is not None:
+        Xte_sel = Xte_pp[:, fs_idx]
+    else:
+        Xte_sel = Xte_pp
+
+    # PLS予測
+    pls = cache["pls_model"]
+    pred = pls.predict(Xte_sel).ravel()
+
+    if cache["tf"] == "sqrt":
+        return np.clip(pred, 0, None) ** 2
+    return pred
+
+
+# ============================================================
+# 非キャッシュ版（テスト互換）
+# ============================================================
+
 def run_model_full(X_train, y_train, groups_train, X_test, cfg):
-    """train全体でfit → test predict（提出用）。"""
+    """train全体でfit -> test predict（提出用、非キャッシュ版）。"""
     Xtr, Xte = pp(X_train, X_test, groups_train, cfg["pp"])
     Xtr, Xte = fs(Xtr, Xte, y_train, cfg.get("fs"))
 
@@ -165,45 +285,12 @@ def run_model_full(X_train, y_train, groups_train, X_test, cfg):
 
 def run_model_cv(X_tr, X_te, y_tr, g_tr, cfg):
     """CVフォールド内でのモデル実行。"""
-    Xtr, Xte = pp(X_tr, X_te, g_tr, cfg["pp"])
-    Xtr, Xte = fs(Xtr, Xte, y_tr, cfg.get("fs"))
-
-    nc = cfg.get("nc", 4)
-    tf = cfg["tf"]
-    nc = max(1, min(nc, Xtr.shape[1] - 1))
-
-    yf = np.sqrt(y_tr) if tf == "sqrt" else y_tr.copy()
-    pls = PLSRegression(n_components=nc)
-    pls.fit(Xtr, yf)
-    pred = pls.predict(Xte).ravel()
-
-    if tf == "sqrt":
-        return np.clip(pred, 0, None) ** 2
-    return pred
+    return run_model_full(X_tr, y_tr, g_tr, X_te, cfg)
 
 
 def predict_with_tta(X_train, y_train, groups_train, X_test, model_cfgs,
                      n_aug=10, seed=42, tta_params=None):
-    """TTAで予測する。
-
-    Parameters
-    ----------
-    X_train, y_train, groups_train : 訓練データ
-    X_test : テストスペクトル
-    model_cfgs : list of dict
-        モデル設定のリスト
-    n_aug : int
-        拡張バージョンの数
-    seed : int
-        乱数シード
-    tta_params : dict or None
-        TTAのノイズパラメータ（offset_std, slope_std, scale_std, noise_std）
-
-    Returns
-    -------
-    ndarray
-        TTA平均予測値
-    """
+    """TTAで予測する（キャッシュ使用版）。"""
     if tta_params is None:
         tta_params = {}
 
@@ -211,17 +298,21 @@ def predict_with_tta(X_train, y_train, groups_train, X_test, model_cfgs,
         X_test, n_aug=n_aug, seed=seed, **tta_params
     )
 
+    # 各モデルのキャッシュを事前構築
+    caches = []
+    for cfg in model_cfgs:
+        cache = build_train_cache(X_train, y_train, groups_train, cfg)
+        caches.append(cache)
+
     all_preds = []
     for X_test_aug in augmented_tests:
         preds_for_this_aug = []
-        for cfg in model_cfgs:
-            pred = run_model_full(X_train, y_train, groups_train, X_test_aug, cfg)
+        for cache in caches:
+            pred = predict_from_cache(X_test_aug, cache)
             preds_for_this_aug.append(pred)
-        # モデルアンサンブル
         avg_pred = np.mean(preds_for_this_aug, axis=0)
         all_preds.append(avg_pred)
 
-    # TTAアンサンブル
     tta_pred = np.mean(all_preds, axis=0)
     return np.clip(tta_pred, 0, 300)
 
@@ -237,20 +328,19 @@ def predict_without_tta(X_train, y_train, groups_train, X_test, model_cfgs):
 
 
 # ============================================================
-# LOSO-CV評価
+# LOSO-CV評価（高速版）
 # ============================================================
 
 def evaluate_tta_cv(X, y, groups, model_cfgs, n_aug=10, seed=42, tta_params=None):
-    """LOSO-CVでTTAあり/なしを評価する。
-
-    Returns
-    -------
-    dict
-        TTAあり/なしそれぞれのfold別RMSE・平均RMSE
-    """
+    """LOSO-CVでTTAあり/なしを評価する（キャッシュ使用高速版）。"""
     logo = LeaveOneGroupOut()
     folds = list(logo.split(X, y, groups))
     species_list = [np.unique(groups[te])[0] for _, te in folds]
+
+    if tta_params is None:
+        tta_params_use = {}
+    else:
+        tta_params_use = tta_params
 
     results_tta = []
     results_notta = []
@@ -261,34 +351,39 @@ def evaluate_tta_cv(X, y, groups, model_cfgs, n_aug=10, seed=42, tta_params=None
         g_tr = groups[train_idx]
         sp = species_list[fold_idx]
 
-        # TTAなし
-        preds_notta = []
+        # 各モデルのキャッシュを構築（1回のみ）
+        caches = []
         for cfg in model_cfgs:
-            pred = run_model_cv(X_tr, X_te, y_tr, g_tr, cfg)
+            cache = build_train_cache(X_tr, y_tr, g_tr, cfg)
+            caches.append(cache)
+
+        # TTAなし予測
+        preds_notta = []
+        for cache in caches:
+            pred = predict_from_cache(X_te, cache)
             preds_notta.append(pred)
         avg_notta = np.clip(np.mean(preds_notta, axis=0), 0, 300)
         r_notta = rmse(y_te, avg_notta)
         results_notta.append({"species": sp, "rmse": r_notta})
 
-        # TTAあり
-        if tta_params is None:
-            tta_params_use = {}
+        # TTAあり予測
+        if n_aug > 0:
+            augmented_tests = generate_augmented_spectra(
+                X_te, n_aug=n_aug, seed=seed, **tta_params_use
+            )
+            all_tta_preds = []
+            for X_te_aug in augmented_tests:
+                preds_for_aug = []
+                for cache in caches:
+                    pred = predict_from_cache(X_te_aug, cache)
+                    preds_for_aug.append(pred)
+                avg_pred = np.mean(preds_for_aug, axis=0)
+                all_tta_preds.append(avg_pred)
+            tta_pred = np.clip(np.mean(all_tta_preds, axis=0), 0, 300)
+            r_tta = rmse(y_te, tta_pred)
         else:
-            tta_params_use = tta_params
+            r_tta = r_notta
 
-        augmented_tests = generate_augmented_spectra(
-            X_te, n_aug=n_aug, seed=seed, **tta_params_use
-        )
-        all_tta_preds = []
-        for X_te_aug in augmented_tests:
-            preds_for_aug = []
-            for cfg in model_cfgs:
-                pred = run_model_cv(X_tr, X_te_aug, y_tr, g_tr, cfg)
-                preds_for_aug.append(pred)
-            avg_pred = np.mean(preds_for_aug, axis=0)
-            all_tta_preds.append(avg_pred)
-        tta_pred = np.clip(np.mean(all_tta_preds, axis=0), 0, 300)
-        r_tta = rmse(y_te, tta_pred)
         results_tta.append({"species": sp, "rmse": r_tta})
 
         print(f"  Fold {fold_idx+1}/{len(folds)} [{sp}]: "
@@ -298,7 +393,6 @@ def evaluate_tta_cv(X, y, groups, model_cfgs, n_aug=10, seed=42, tta_params=None
     mean_notta = np.mean([r["rmse"] for r in results_notta])
     mean_tta = np.mean([r["rmse"] for r in results_tta])
 
-    # ベイスギ除外
     notta_nobs = [r["rmse"] for r in results_notta if r["species"] != "ベイスギ"]
     tta_nobs = [r["rmse"] for r in results_tta if r["species"] != "ベイスギ"]
     mean_notta_nobs = np.mean(notta_nobs) if notta_nobs else mean_notta
@@ -344,17 +438,18 @@ def main():
     ]
 
     # ========================================
-    # Phase 1: LOSO-CVでTTAなしのベースライン評価
+    # Phase 1: LOSO-CVベースライン
     # ========================================
     print("\n--- Phase 1: ベースライン（TTAなし）LOSO-CV ---")
     cv_base = evaluate_tta_cv(
         X_train, y_train, groups_train, model_cfgs,
         n_aug=0, seed=42, tta_params=None
     )
-    print(f"\nベースライン RMSE: {cv_base['notta']['mean_rmse']:.4f}")
+    baseline_rmse = cv_base['notta']['mean_rmse']
+    print(f"\nベースライン RMSE: {baseline_rmse:.4f}")
 
     # ========================================
-    # Phase 2: デフォルトTTA LOSO-CV
+    # Phase 2: デフォルトTTA
     # ========================================
     print("\n--- Phase 2: デフォルトTTA (n_aug=10) ---")
     cv_default = evaluate_tta_cv(
@@ -366,11 +461,10 @@ def main():
     print(f"差分: {cv_default['tta']['mean_rmse'] - cv_default['notta']['mean_rmse']:+.4f}")
 
     # ========================================
-    # Phase 3: ノイズレベル最適化
+    # Phase 3: ノイズレベル最適化（逐次的に各パラメータを最適化）
     # ========================================
     print("\n--- Phase 3: ノイズレベル最適化 ---")
 
-    # 各パラメータをグリッドサーチ
     param_grids = {
         "offset_std": [0.0005, 0.001, 0.002, 0.005],
         "slope_std": [1e-7, 5e-7, 1e-6, 5e-6],
@@ -415,7 +509,7 @@ def main():
     print(f"  ベストRMSE: {best_rmse_overall:.4f}")
 
     # ========================================
-    # Phase 4: n_augの最適化
+    # Phase 4: n_aug最適化
     # ========================================
     print("\n--- Phase 4: n_aug最適化 ---")
     n_aug_values = [5, 10, 20, 50]
@@ -435,7 +529,7 @@ def main():
     print(f"\n  ベストn_aug: {best_n_aug} (RMSE={best_n_aug_entry['rmse_tta']:.4f})")
 
     # ========================================
-    # Phase 5: 最終評価（ベストパラメータ）
+    # Phase 5: 最終評価
     # ========================================
     print("\n--- Phase 5: 最終評価 ---")
     cv_final = evaluate_tta_cv(
@@ -497,17 +591,6 @@ def main():
     # ========================================
     # 結果保存
     # ========================================
-    all_results = {
-        "baseline_rmse": cv_base['notta']['mean_rmse'],
-        "default_tta_rmse": cv_default['tta']['mean_rmse'],
-        "best_params": best_params,
-        "best_n_aug": best_n_aug,
-        "final_tta_rmse": cv_final['tta']['mean_rmse'],
-        "final_notta_rmse": cv_final['notta']['mean_rmse'],
-        "improvement": cv_final['notta']['mean_rmse'] - cv_final['tta']['mean_rmse'],
-    }
-
-    # Grid search結果をCSV
     pd.DataFrame(grid_results).to_csv(
         MODEL_OUT / "issue100_tta_grid_results.csv", index=False
     )
@@ -517,12 +600,12 @@ def main():
 
     print(f"\n{'='*70}")
     print("サマリー:")
-    print(f"  ベースライン RMSE: {all_results['baseline_rmse']:.4f}")
-    print(f"  デフォルトTTA RMSE: {all_results['default_tta_rmse']:.4f}")
-    print(f"  最適化TTA RMSE: {all_results['final_tta_rmse']:.4f}")
-    print(f"  改善: {all_results['improvement']:+.4f}")
-    print(f"  ベストパラメータ: {all_results['best_params']}")
-    print(f"  ベストn_aug: {all_results['best_n_aug']}")
+    print(f"  ベースライン RMSE: {baseline_rmse:.4f}")
+    print(f"  デフォルトTTA RMSE: {cv_default['tta']['mean_rmse']:.4f}")
+    print(f"  最適化TTA RMSE: {cv_final['tta']['mean_rmse']:.4f}")
+    print(f"  改善: {baseline_rmse - cv_final['tta']['mean_rmse']:+.4f}")
+    print(f"  ベストパラメータ: {best_params}")
+    print(f"  ベストn_aug: {best_n_aug}")
     print(f"  経過時間: {time.time() - t0:.0f}s")
     print("=" * 70)
 

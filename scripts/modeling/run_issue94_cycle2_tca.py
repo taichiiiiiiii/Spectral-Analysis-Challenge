@@ -3,6 +3,11 @@
 仮説: TCA変換後の特徴空間でPLS/Ridge/Huber回帰を行えば、
 train-test間の分布差が縮小し、LBスコアが改善する。
 
+高速化戦略:
+- TCAのカーネル行列(n×n)の固有値分解がO(n^3)で非常に重い
+- 各樹種から代表サンプルをサブサンプリングしてTCA射影を学習
+- 学習した射影行列Wを使って全データを変換
+
 パラメータグリッド:
 - kernel: ['linear', 'rbf']
 - n_components: [3, 5, 10, 15, 20]
@@ -23,12 +28,13 @@ import time
 
 warnings.filterwarnings("ignore")
 
+from scipy.linalg import eigh
+from sklearn.metrics.pairwise import rbf_kernel, linear_kernel
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.linear_model import Ridge, HuberRegressor
 from sklearn.model_selection import LeaveOneGroupOut
 
 from src.eda.data_loader import load_train, load_test, get_spectral_columns
-from src.preprocessing.issue38_tca import tca_transform
 from src.preprocessing.issue18_snv import apply_snv
 from src.preprocessing.issue22_epo import compute_epo_projection, apply_epo
 
@@ -36,9 +42,109 @@ DATA_DIR = Path(__file__).resolve().parents[2] / "Input_data"
 OUT_DIR = Path(__file__).resolve().parents[2] / "outputs" / "modeling"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# サブサンプリング: 各グループからこの数のサンプルを抽出
+# eigh(n,n)の計算コスト: 100x100=0.6s, 150x150=1.7s, 200x200=2.6s
+SUBSAMPLE_PER_GROUP = 5
+MAX_SUBSAMPLE_TOTAL = 50  # source60 + target50 = 110程度を目標
+
 
 def rmse(a, b):
     return float(np.sqrt(np.mean((a - b) ** 2)))
+
+
+def subsample_by_group(X, groups, n_per_group=SUBSAMPLE_PER_GROUP, seed=42):
+    """各グループから代表サンプルをサブサンプリングする。
+    Returns: indices of selected samples
+    """
+    rng = np.random.RandomState(seed)
+    indices = []
+    for g in np.unique(groups):
+        g_idx = np.where(groups == g)[0]
+        n = min(n_per_group, len(g_idx))
+        selected = rng.choice(g_idx, size=n, replace=False)
+        indices.extend(selected.tolist())
+    return np.array(sorted(indices))
+
+
+def tca_transform_fast(X_source, X_target, n_components=10, kernel="rbf",
+                       gamma=None, mu=1.0, source_groups=None):
+    """サブサンプリングTCA: 代表サンプルで射影を学習し、全データに適用。
+
+    1. source/targetからサブサンプルを抽出
+    2. サブサンプルでカーネル行列・固有値問題を解く
+    3. 全データのカーネル行列を計算して射影を適用
+    """
+    n_s = len(X_source)
+    n_t = len(X_target)
+
+    # サブサンプリング
+    if source_groups is not None and n_s > MAX_SUBSAMPLE_TOTAL:
+        sub_s_idx = subsample_by_group(X_source, source_groups, n_per_group=SUBSAMPLE_PER_GROUP)
+    else:
+        sub_s_idx = np.arange(n_s)
+
+    # ターゲットもサブサンプリング
+    if n_t > MAX_SUBSAMPLE_TOTAL:
+        rng = np.random.RandomState(42)
+        sub_t_idx = rng.choice(n_t, size=min(MAX_SUBSAMPLE_TOTAL, n_t), replace=False)
+        sub_t_idx = np.sort(sub_t_idx)
+    else:
+        sub_t_idx = np.arange(n_t)
+
+    X_sub_s = X_source[sub_s_idx]
+    X_sub_t = X_target[sub_t_idx]
+    n_sub_s = len(X_sub_s)
+    n_sub_t = len(X_sub_t)
+    n_sub = n_sub_s + n_sub_t
+
+    X_sub_all = np.vstack([X_sub_s, X_sub_t])
+
+    # カーネル行列（サブサンプル間）
+    if kernel == "rbf":
+        if gamma is None:
+            gamma = 1.0 / X_sub_all.shape[1]
+        K_sub = rbf_kernel(X_sub_all, gamma=gamma)
+    elif kernel == "linear":
+        K_sub = linear_kernel(X_sub_all)
+    else:
+        raise ValueError(f"Unknown kernel: {kernel}")
+
+    # MMDペナルティ行列
+    L = np.zeros((n_sub, n_sub))
+    L[:n_sub_s, :n_sub_s] = 1.0 / (n_sub_s * n_sub_s)
+    L[n_sub_s:, n_sub_s:] = 1.0 / (n_sub_t * n_sub_t)
+    L[:n_sub_s, n_sub_s:] = -1.0 / (n_sub_s * n_sub_t)
+    L[n_sub_s:, :n_sub_s] = -1.0 / (n_sub_s * n_sub_t)
+
+    # センタリング行列
+    H = np.eye(n_sub) - np.ones((n_sub, n_sub)) / n_sub
+
+    # 一般化固有値問題
+    A = K_sub @ L @ K_sub + mu * np.eye(n_sub)
+    B = K_sub @ H @ K_sub
+
+    B = (B + B.T) / 2
+    min_eig = np.real(np.linalg.eigvalsh(B).min())
+    reg = max(1e-8, -min_eig + 1e-6) if min_eig < 1e-6 else 1e-8
+    B += reg * np.eye(n_sub)
+
+    nc = min(n_components, n_sub)
+    eigenvalues, eigenvectors = eigh(A, B)
+    W = eigenvectors[:, :nc]
+
+    # 全データのカーネル行列（全データ vs サブサンプル）
+    X_all_full = np.vstack([X_source, X_target])
+    if kernel == "rbf":
+        K_full = rbf_kernel(X_all_full, X_sub_all, gamma=gamma)
+    else:
+        K_full = linear_kernel(X_all_full, X_sub_all)
+
+    # 射影
+    Z = K_full @ W
+    Z_source = Z[:n_s]
+    Z_target = Z[n_s:]
+
+    return Z_source, Z_target
 
 
 def preprocess(X_tr, X_te, groups_tr, method):
@@ -92,10 +198,13 @@ def run_loso_cv(X, y, groups, kernel, n_components, mu, pp_method, reg_name, tar
         # 前処理
         X_tr_pp, X_te_pp = preprocess(X_tr, X_te, g_tr, pp_method)
 
-        # TCA変換
+        # TCA変換（サブサンプリング版）
         nc = min(n_components, len(tr_idx), len(te_idx))
         try:
-            Z_tr, Z_te = tca_transform(X_tr_pp, X_te_pp, n_components=nc, kernel=kernel, mu=mu)
+            Z_tr, Z_te = tca_transform_fast(
+                X_tr_pp, X_te_pp, n_components=nc, kernel=kernel, mu=mu,
+                source_groups=g_tr
+            )
         except Exception:
             return None, None, None
 
@@ -133,6 +242,7 @@ def run_loso_cv(X, y, groups, kernel, n_components, mu, pp_method, reg_name, tar
 def main():
     print("=" * 70)
     print("Issue #94 Cycle 2: TCA Domain Adaptation Pipeline")
+    print("(Subsampled TCA for speed)")
     print("=" * 70)
 
     t0 = time.time()
@@ -151,61 +261,105 @@ def main():
 
     print(f"Train: {X_train.shape}, Test: {X_test.shape}")
     print(f"Species (train): {np.unique(groups)}")
+    print(f"Subsample config: {SUBSAMPLE_PER_GROUP}/group, max {MAX_SUBSAMPLE_TOTAL}")
     print()
 
     # ========================================
-    # Phase 1: LOSO-CV グリッドサーチ
+    # Phase 1: LOSO-CV 2段階グリッドサーチ
     # ========================================
-    print("Phase 1: LOSO-CV Grid Search")
+    print("Phase 1a: Coarse Grid Search")
     print("-" * 50)
 
-    # Phase 1a: 粗いグリッドサーチ（計算コスト削減）
-    # カーネル行列サイズ ~1400x1400 の固有値分解を毎fold行うため、
-    # まず小さいグリッドで探索し、良い領域を特定する
-    kernels = ["linear", "rbf"]
-    n_components_list = [5, 10, 20]
-    mus = [0.1, 1.0, 10.0]
+    # Stage 1: 粗いグリッド（72パターン）
+    kernels_coarse = ["linear", "rbf"]
+    nc_coarse = [5, 10, 20]
+    mus_coarse = [0.1, 1.0, 10.0]
     preprocessings = ["raw", "snv", "epo1"]
     regressors = ["pls3", "ridge", "huber"]
     target_transforms = ["raw", "sqrt"]
 
     results = []
-    total = len(kernels) * len(n_components_list) * len(mus) * len(preprocessings) * len(regressors) * len(target_transforms)
-    count = 0
 
-    for kernel in kernels:
-        for nc in n_components_list:
-            for mu in mus:
-                for pp in preprocessings:
-                    for reg in regressors:
-                        for tt in target_transforms:
-                            count += 1
-                            if count % 50 == 0:
-                                print(f"  [{count}/{total}] ...")
+    # 前処理をキャッシュ（各fold × 前処理の組み合わせ）
+    logo = LeaveOneGroupOut()
+    folds = list(logo.split(X_train, y_train, groups))
 
-                            overall, fold_rmses, fold_species = run_loso_cv(
-                                X_train, y_train, groups,
-                                kernel, nc, mu, pp, reg, tt
-                            )
+    def run_grid(kernels, nc_list, mus, pps, regs, tts, label=""):
+        local_results = []
+        total = len(kernels) * len(nc_list) * len(mus) * len(pps) * len(regs) * len(tts)
+        count = 0
+        for kernel in kernels:
+            for nc in nc_list:
+                for mu in mus:
+                    for pp in pps:
+                        for reg in regs:
+                            for tt in tts:
+                                count += 1
+                                if count % 10 == 0:
+                                    elapsed = time.time() - t0
+                                    print(f"  {label}[{count}/{total}] {elapsed:.0f}s ...")
 
-                            if overall is not None:
-                                results.append({
-                                    "kernel": kernel,
-                                    "n_components": nc,
-                                    "mu": mu,
-                                    "preprocessing": pp,
-                                    "regressor": reg,
-                                    "target_transform": tt,
-                                    "rmse": overall,
-                                    "fold_rmses": fold_rmses,
-                                    "fold_species": fold_species,
-                                })
+                                overall, fold_rmses, fold_species = run_loso_cv(
+                                    X_train, y_train, groups,
+                                    kernel, nc, mu, pp, reg, tt
+                                )
+
+                                if overall is not None:
+                                    local_results.append({
+                                        "kernel": kernel,
+                                        "n_components": nc,
+                                        "mu": mu,
+                                        "preprocessing": pp,
+                                        "regressor": reg,
+                                        "target_transform": tt,
+                                        "rmse": overall,
+                                        "fold_rmses": fold_rmses,
+                                        "fold_species": fold_species,
+                                    })
+        return local_results
+
+    results = run_grid(kernels_coarse, nc_coarse, mus_coarse,
+                       preprocessings, regressors, target_transforms, "coarse ")
+
+    # Stage 1結果を確認
+    df_coarse = pd.DataFrame(results).sort_values("rmse").reset_index(drop=True)
+    print(f"\nCoarse search: {len(df_coarse)} valid results")
+    if len(df_coarse) > 0:
+        print(f"Best coarse RMSE: {df_coarse.iloc[0]['rmse']:.4f}")
+        top3 = df_coarse.head(3)
+        for _, r in top3.iterrows():
+            print(f"  k={r['kernel']}, nc={r['n_components']}, mu={r['mu']}, "
+                  f"pp={r['preprocessing']}, reg={r['regressor']}, tt={r['target_transform']} -> {r['rmse']:.3f}")
+
+    # Stage 2: ベスト周辺の精密探索
+    print(f"\nPhase 1b: Fine Grid Search (around best)")
+    print("-" * 50)
+
+    if len(df_coarse) > 0:
+        best_coarse = df_coarse.iloc[0]
+        # ベストカーネルの周辺で精密探索
+        best_k = best_coarse["kernel"]
+        best_nc = int(best_coarse["n_components"])
+        best_mu = best_coarse["mu"]
+        best_pp = best_coarse["preprocessing"]
+
+        # 精密nc: ベスト±の近傍
+        fine_nc = sorted(set([max(3, best_nc - 5), best_nc, best_nc + 5, best_nc + 10]))
+        # 精密mu: ベストの前後
+        mu_idx = [0.01, 0.1, 1.0, 10.0]
+        fine_mu = sorted(set([best_mu / 3, best_mu, best_mu * 3]))
+        fine_mu = [m for m in fine_mu if 0.001 <= m <= 100.0]
+
+        fine_results = run_grid([best_k], fine_nc, fine_mu,
+                                [best_pp], regressors, target_transforms, "fine ")
+        results.extend(fine_results)
 
     # 結果をDataFrameに
     df_results = pd.DataFrame(results)
     df_results = df_results.sort_values("rmse").reset_index(drop=True)
 
     print(f"\nCompleted {count} configurations, {len(df_results)} valid results")
+    print(f"Time: {time.time()-t0:.0f}s")
     print(f"\nTop 20 configurations by LOSO-CV RMSE:")
     print("-" * 90)
     print(f"{'Rank':>4} {'Kernel':>7} {'NC':>3} {'Mu':>6} {'PP':>5} {'Reg':>6} {'TT':>5} {'RMSE':>8}")
@@ -246,7 +400,10 @@ def main():
     X_tr_pp, X_te_pp = preprocess(X_train, X_test, groups, bpp)
 
     # TCA変換（train全体 → test全体）
-    Z_tr, Z_te = tca_transform(X_tr_pp, X_te_pp, n_components=bnc, kernel=bk, mu=bmu)
+    Z_tr, Z_te = tca_transform_fast(
+        X_tr_pp, X_te_pp, n_components=bnc, kernel=bk, mu=bmu,
+        source_groups=groups
+    )
     print(f"TCA transformed: train={Z_tr.shape}, test={Z_te.shape}")
 
     # 目的変数変換
@@ -277,7 +434,10 @@ def main():
     for i, row in df_results.head(5).iterrows():
         X_tr_pp, X_te_pp = preprocess(X_train, X_test, groups, row["preprocessing"])
         nc = int(row["n_components"])
-        Z_tr, Z_te = tca_transform(X_tr_pp, X_te_pp, n_components=nc, kernel=row["kernel"], mu=row["mu"])
+        Z_tr, Z_te = tca_transform_fast(
+            X_tr_pp, X_te_pp, n_components=nc, kernel=row["kernel"], mu=row["mu"],
+            source_groups=groups
+        )
 
         if row["target_transform"] == "sqrt":
             y_f = np.sqrt(y_train)
