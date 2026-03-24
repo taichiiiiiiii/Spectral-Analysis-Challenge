@@ -13,6 +13,7 @@ import time
 import warnings
 from itertools import product
 from pathlib import Path
+from functools import partial
 
 import numpy as np
 import pandas as pd
@@ -171,7 +172,7 @@ def main():
                     result[f"rmse_{fr['species']}"] = fr["rmse"]
             results.append(result)
 
-            if count % 40 == 0 or count == total:
+            if count % 10 == 0 or count == total or count == 1:
                 elapsed = time.time() - start_time
                 print(f"  [{count}/{total}] elapsed={elapsed:.0f}s | "
                       f"preproc={preproc}, y_tf={y_tf}, n_comp={n_comp}, "
@@ -382,4 +383,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # 出力バッファリングを無効化
+    import functools
+    print = functools.partial(print, flush=True)
     main()
