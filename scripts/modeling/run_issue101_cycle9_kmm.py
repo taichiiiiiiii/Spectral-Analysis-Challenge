@@ -240,6 +240,17 @@ def main():
     print("=" * 70)
 
     # --- モデル定義 ---
+    # KMM重みはfold内で再利用するため、事前にキャッシュする
+    # key: (pp, pca_dim, kmm_B, fold_idx) -> weights
+    kmm_cache = {}
+
+    def get_kmm_weights_cached(X_tr_raw, X_te_raw, groups_train, pp, pca_dim, kmm_B, fold_idx):
+        key = (pp, pca_dim, kmm_B, fold_idx)
+        if key not in kmm_cache:
+            X_tr, X_te = preprocess(X_tr_raw, X_te_raw, groups_train, pp)
+            kmm_cache[key] = compute_kmm_for_fold(X_tr, X_te, pca_dim, kmm_B)
+        return kmm_cache[key]
+
     models = [
         # ベースライン（KMM無し）
         {"name": "BL1:EPO+PLS4+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt",
@@ -249,50 +260,32 @@ def main():
         {"name": "BL3:EPO+GBR+raw", "pp": "EPO(1)", "nc": 4, "tf": "raw",
          "func": predict_fold_nokmm_gbr},
 
-        # KMM重み付きRidge (PCA dim=20)
+        # KMM重み付きRidge: 代表的な設定
         {"name": "KR1:EPO+KMM20+Ridge+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt",
          "pca_dim": 20, "kmm_B": 10.0, "alpha": 1.0,
          "func": predict_fold_kmm_ridge},
         {"name": "KR2:SNV+KMM20+Ridge+sqrt", "pp": "SNV", "nc": 4, "tf": "sqrt",
          "pca_dim": 20, "kmm_B": 10.0, "alpha": 1.0,
          "func": predict_fold_kmm_ridge},
-        {"name": "KR3:raw+KMM20+Ridge+sqrt", "pp": "raw", "nc": 4, "tf": "sqrt",
+        {"name": "KR3:EPO+KMM50+Ridge+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt",
+         "pca_dim": 50, "kmm_B": 10.0, "alpha": 1.0,
+         "func": predict_fold_kmm_ridge},
+        {"name": "KR4:raw+KMM20+Ridge+sqrt", "pp": "raw", "nc": 4, "tf": "sqrt",
          "pca_dim": 20, "kmm_B": 10.0, "alpha": 1.0,
          "func": predict_fold_kmm_ridge},
-
-        # KMM重み付きRidge (PCA dim=50)
-        {"name": "KR4:EPO+KMM50+Ridge+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt",
-         "pca_dim": 50, "kmm_B": 10.0, "alpha": 1.0,
-         "func": predict_fold_kmm_ridge},
-        {"name": "KR5:SNV+KMM50+Ridge+sqrt", "pp": "SNV", "nc": 4, "tf": "sqrt",
-         "pca_dim": 50, "kmm_B": 10.0, "alpha": 1.0,
-         "func": predict_fold_kmm_ridge},
-
-        # KMM重み付きRidge (PCA dim=100)
-        {"name": "KR6:EPO+KMM100+Ridge+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt",
+        {"name": "KR5:EPO+KMM100+Ridge+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt",
          "pca_dim": 100, "kmm_B": 10.0, "alpha": 1.0,
          "func": predict_fold_kmm_ridge},
 
-        # KMM重み付きRidge (B=5, lower upper bound)
-        {"name": "KR7:EPO+KMM50B5+Ridge+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt",
-         "pca_dim": 50, "kmm_B": 5.0, "alpha": 1.0,
-         "func": predict_fold_kmm_ridge},
-
-        # KMM重み付きGBR
+        # KMM重み付きGBR: 代表的な設定
         {"name": "KG1:EPO+KMM20+GBR+raw", "pp": "EPO(1)", "nc": 4, "tf": "raw",
          "pca_dim": 20, "kmm_B": 10.0,
          "func": predict_fold_kmm_gbr},
         {"name": "KG2:SNV+KMM20+GBR+raw", "pp": "SNV", "nc": 4, "tf": "raw",
          "pca_dim": 20, "kmm_B": 10.0,
          "func": predict_fold_kmm_gbr},
-        {"name": "KG3:EPO+KMM50+GBR+raw", "pp": "EPO(1)", "nc": 4, "tf": "raw",
-         "pca_dim": 50, "kmm_B": 10.0,
-         "func": predict_fold_kmm_gbr},
-        {"name": "KG4:EPO+KMM20+GBR+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt",
+        {"name": "KG3:EPO+KMM20+GBR+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt",
          "pca_dim": 20, "kmm_B": 10.0,
-         "func": predict_fold_kmm_gbr},
-        {"name": "KG5:SNV+KMM50+GBR+sqrt", "pp": "SNV", "nc": 4, "tf": "sqrt",
-         "pca_dim": 50, "kmm_B": 10.0,
          "func": predict_fold_kmm_gbr},
 
         # KMM重み付きPLS
@@ -302,17 +295,6 @@ def main():
         {"name": "KP2:SNV+KMM20+wPLS+sqrt", "pp": "SNV", "nc": 4, "tf": "sqrt",
          "pca_dim": 20, "kmm_B": 10.0,
          "func": predict_fold_kmm_wpls},
-        {"name": "KP3:EPO+KMM50+wPLS+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt",
-         "pca_dim": 50, "kmm_B": 10.0,
-         "func": predict_fold_kmm_wpls},
-
-        # KMM重み付きRidge (alpha tuning)
-        {"name": "KR8:EPO+KMM50+Ridge0.1+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt",
-         "pca_dim": 50, "kmm_B": 10.0, "alpha": 0.1,
-         "func": predict_fold_kmm_ridge},
-        {"name": "KR9:EPO+KMM50+Ridge10+sqrt", "pp": "EPO(1)", "nc": 4, "tf": "sqrt",
-         "pca_dim": 50, "kmm_B": 10.0, "alpha": 10.0,
-         "func": predict_fold_kmm_ridge},
     ]
 
     n_models = len(models)
