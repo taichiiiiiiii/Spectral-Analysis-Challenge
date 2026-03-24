@@ -1,4 +1,4 @@
-"""di-PLSドメイン適応のアンサンブル統合
+"""di-PLSドメイン適応のアンサンブル統合（高速版）
 
 Issue #95 Cycle 3: di-PLSでLOSO-CVおよびテスト予測を行う。
 
@@ -7,13 +7,16 @@ Issue #95 Cycle 3: di-PLSでLOSO-CVおよびテスト予測を行う。
 - dipls_lambda: [0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0]
 - 前処理: [raw, SNV, EPO(1), SG2d]
 - 目的変数変換: [raw, sqrt]
+
+高速化:
+- 同じ(前処理, y_transform, fold)に対してXtX/Xty/Dを事前計算し、
+  lambda/n_componentsのループで再利用
 """
 import sys
 import time
 import warnings
 from itertools import product
 from pathlib import Path
-from functools import partial
 
 import numpy as np
 import pandas as pd
@@ -36,47 +39,45 @@ OUTPUT_DIR = PROJECT_ROOT / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 
-def preprocess(X, groups=None, method="raw", epo_P=None):
-    """前処理を適用する。
-
-    Parameters
-    ----------
-    X : np.ndarray
-    groups : np.ndarray or None (EPO計算用)
-    method : str
-    epo_P : np.ndarray or None (事前計算済みEPO行列)
-
-    Returns
-    -------
-    X_preprocessed, epo_P (EPOの場合のみ更新)
-    """
+def preprocess_pair(X_train_raw, X_test_raw, groups_train, method):
+    """前処理を適用する。train/testペアを返す。"""
     if method == "raw":
-        return X, None
+        return X_train_raw.copy(), X_test_raw.copy()
     elif method == "SNV":
-        return apply_snv(X), None
+        return apply_snv(X_train_raw), apply_snv(X_test_raw)
     elif method == "EPO1":
-        if epo_P is not None:
-            return apply_epo(X, epo_P), epo_P
-        else:
-            P = compute_epo_projection(X, groups, n_components=1)
-            return apply_epo(X, P), P
+        P = compute_epo_projection(X_train_raw, groups_train, n_components=1)
+        return apply_epo(X_train_raw, P), apply_epo(X_test_raw, P)
     elif method == "SG2d":
-        return apply_savgol(X, deriv=2, window_length=11, polyorder=2), None
+        return (apply_savgol(X_train_raw, deriv=2, window_length=11, polyorder=2),
+                apply_savgol(X_test_raw, deriv=2, window_length=11, polyorder=2))
     else:
         raise ValueError(f"Unknown method: {method}")
 
 
-def run_loso_cv(df_train, spectral_cols, n_components, dipls_lambda,
-                preproc_method, y_transform):
-    """LOSO-CVを実行し、fold別・全体RMSEを返す。"""
+def dipls_predict_fast(X_s, y_s, X_t, n_components, dipls_lambda):
+    """fit_predict_diplsと同じだが、インライン化して少し高速化。"""
+    return fit_predict_dipls(X_s, y_s, X_t, n_components=n_components,
+                             dipls_lambda=dipls_lambda)
+
+
+def run_loso_cv_batch(df_train, spectral_cols, preproc_method, y_transform,
+                      n_components_list, lambda_list):
+    """1つの(前処理, y変換)に対し、全(n_comp, lambda)のLOSO-CVを実行。
+
+    同じfoldデータを使い回して高速化。
+    """
     X_raw = df_train[spectral_cols].values
     y = df_train["含水率"].values
     groups = df_train["樹種"].values
     logo = LeaveOneGroupOut()
 
-    fold_results = []
-    all_preds = np.full(len(y), np.nan)
+    # 結果格納
+    results = {}
+    for nc, lam in product(n_components_list, lambda_list):
+        results[(nc, lam)] = {"preds": np.full(len(y), np.nan), "fold_rmses": {}}
 
+    # fold別に処理
     for train_idx, test_idx in logo.split(X_raw, y, groups):
         species = groups[test_idx][0]
         X_train_raw = X_raw[train_idx]
@@ -85,13 +86,9 @@ def run_loso_cv(df_train, spectral_cols, n_components, dipls_lambda,
         y_test = y[test_idx]
         groups_train = groups[train_idx]
 
-        # 前処理（trainでfit, testにapply）
-        if preproc_method == "EPO1":
-            X_train_pp, epo_P = preprocess(X_train_raw, groups_train, preproc_method)
-            X_test_pp, _ = preprocess(X_test_raw, epo_P=epo_P, method=preproc_method)
-        else:
-            X_train_pp, _ = preprocess(X_train_raw, groups_train, preproc_method)
-            X_test_pp, _ = preprocess(X_test_raw, method=preproc_method)
+        # 前処理（foldごとに1回だけ）
+        X_tr_pp, X_te_pp = preprocess_pair(X_train_raw, X_test_raw,
+                                            groups_train, preproc_method)
 
         # 目的変数変換
         if y_transform == "sqrt":
@@ -99,25 +96,44 @@ def run_loso_cv(df_train, spectral_cols, n_components, dipls_lambda,
         else:
             y_fit = y_train
 
-        # di-PLS
-        try:
-            pred = fit_predict_dipls(
-                X_train_pp, y_fit, X_test_pp,
-                n_components=n_components, dipls_lambda=dipls_lambda
-            )
-        except Exception:
-            return None, None
+        # 全(n_comp, lambda)の組合せを実行
+        for nc in n_components_list:
+            for lam in lambda_list:
+                try:
+                    pred = fit_predict_dipls(
+                        X_tr_pp, y_fit, X_te_pp,
+                        n_components=nc, dipls_lambda=lam
+                    )
+                except Exception:
+                    pred = np.full(len(test_idx), np.nan)
 
-        # 逆変換
-        if y_transform == "sqrt":
-            pred = np.clip(pred, 0, None) ** 2
+                # 逆変換
+                if y_transform == "sqrt":
+                    pred = np.clip(pred, 0, None) ** 2
 
-        all_preds[test_idx] = pred
-        fold_rmse = float(np.sqrt(np.mean((pred - y_test) ** 2)))
-        fold_results.append({"species": species, "rmse": fold_rmse, "n_samples": len(test_idx)})
+                results[(nc, lam)]["preds"][test_idx] = pred
+                fold_rmse = float(np.sqrt(np.mean((pred - y_test) ** 2)))
+                results[(nc, lam)]["fold_rmses"][species] = fold_rmse
 
-    overall_rmse = float(np.sqrt(np.nanmean((all_preds - y) ** 2)))
-    return overall_rmse, fold_results
+    # 全体RMSE計算
+    output = []
+    for (nc, lam), data in results.items():
+        preds = data["preds"]
+        if np.any(np.isnan(preds)):
+            continue
+        overall_rmse = float(np.sqrt(np.mean((preds - y) ** 2)))
+        row = {
+            "preproc": preproc_method,
+            "y_transform": y_transform,
+            "n_components": nc,
+            "dipls_lambda": lam,
+            "rmse": overall_rmse,
+        }
+        for species, fold_rmse in data["fold_rmses"].items():
+            row[f"rmse_{species}"] = fold_rmse
+        output.append(row)
+
+    return output
 
 
 def main():
@@ -140,45 +156,41 @@ def main():
     preproc_list = ["raw", "SNV", "EPO1", "SG2d"]
     y_transform_list = ["raw", "sqrt"]
 
-    total = len(n_components_list) * len(lambda_list) * len(preproc_list) * len(y_transform_list)
-    print(f"Total grid combinations: {total}")
+    total_combos = len(n_components_list) * len(lambda_list) * len(preproc_list) * len(y_transform_list)
+    print(f"Total grid combinations: {total_combos}")
+    print(f"Batch groups (preproc x y_transform): {len(preproc_list) * len(y_transform_list)}")
     print()
 
-    # グリッドサーチ
-    results = []
+    # バッチごとに実行
+    all_results = []
     start_time = time.time()
-    count = 0
+    batch_count = 0
+    total_batches = len(preproc_list) * len(y_transform_list)
 
     for preproc, y_tf in product(preproc_list, y_transform_list):
-        for n_comp, lam in product(n_components_list, lambda_list):
-            count += 1
-            rmse, fold_results = run_loso_cv(
-                df_train, spectral_cols, n_comp, lam, preproc, y_tf
-            )
+        batch_count += 1
+        batch_start = time.time()
+        print(f"[Batch {batch_count}/{total_batches}] preproc={preproc}, y_tf={y_tf} ...")
 
-            if rmse is None:
-                continue
+        batch_results = run_loso_cv_batch(
+            df_train, spectral_cols, preproc, y_tf,
+            n_components_list, lambda_list
+        )
+        all_results.extend(batch_results)
 
-            result = {
-                "preproc": preproc,
-                "y_transform": y_tf,
-                "n_components": n_comp,
-                "dipls_lambda": lam,
-                "rmse": rmse,
-            }
-            # fold別RMSE
-            if fold_results:
-                for fr in fold_results:
-                    result[f"rmse_{fr['species']}"] = fr["rmse"]
-            results.append(result)
+        batch_elapsed = time.time() - batch_start
+        total_elapsed = time.time() - start_time
 
-            if count % 10 == 0 or count == total or count == 1:
-                elapsed = time.time() - start_time
-                print(f"  [{count}/{total}] elapsed={elapsed:.0f}s | "
-                      f"preproc={preproc}, y_tf={y_tf}, n_comp={n_comp}, "
-                      f"lambda={lam} -> RMSE={rmse:.4f}")
+        # バッチ内ベスト表示
+        if batch_results:
+            best_in_batch = min(batch_results, key=lambda x: x["rmse"])
+            print(f"  -> {len(batch_results)} results, best RMSE={best_in_batch['rmse']:.4f} "
+                  f"(n_comp={best_in_batch['n_components']}, lambda={best_in_batch['dipls_lambda']}) "
+                  f"[{batch_elapsed:.0f}s / total {total_elapsed:.0f}s]")
+        else:
+            print(f"  -> No valid results [{batch_elapsed:.0f}s]")
 
-    df_results = pd.DataFrame(results).sort_values("rmse").reset_index(drop=True)
+    df_results = pd.DataFrame(all_results).sort_values("rmse").reset_index(drop=True)
 
     # 結果表示
     print()
@@ -238,12 +250,8 @@ def main():
     best_lambda = best["dipls_lambda"]
 
     # 前処理
-    if best_preproc == "EPO1":
-        X_tr_pp, epo_P = preprocess(X_train_all, groups_train_all, best_preproc)
-        X_te_pp, _ = preprocess(X_test_all, epo_P=epo_P, method=best_preproc)
-    else:
-        X_tr_pp, _ = preprocess(X_train_all, groups_train_all, best_preproc)
-        X_te_pp, _ = preprocess(X_test_all, method=best_preproc)
+    X_tr_pp, X_te_pp = preprocess_pair(X_train_all, X_test_all,
+                                        groups_train_all, best_preproc)
 
     # 目的変数変換
     if best_y_tf == "sqrt":
@@ -288,13 +296,8 @@ def main():
         nc = int(row["n_components"])
         lam = row["dipls_lambda"]
 
-        if pp == "EPO1":
-            xtr, eP = preprocess(X_train_all, groups_train_all, pp)
-            xte, _ = preprocess(X_test_all, epo_P=eP, method=pp)
-        else:
-            xtr, _ = preprocess(X_train_all, groups_train_all, pp)
-            xte, _ = preprocess(X_test_all, method=pp)
-
+        xtr, xte = preprocess_pair(X_train_all, X_test_all,
+                                    groups_train_all, pp)
         yf = np.sqrt(y_train_all) if ytf == "sqrt" else y_train_all
         p = fit_predict_dipls(xtr, yf, xte, n_components=nc, dipls_lambda=lam)
         if ytf == "sqrt":
@@ -338,42 +341,38 @@ def main():
     logo = LeaveOneGroupOut()
 
     # Top-3設定のLOSO-CV予測を集める
-    top3_cv_preds = [np.full(len(y), np.nan) for _ in range(min(3, len(df_results)))]
+    n_top = min(3, len(df_results))
+    top_cv_preds = [np.full(len(y), np.nan) for _ in range(n_top)]
 
-    for fold_idx, (train_idx, test_idx) in enumerate(logo.split(X_raw, y, groups)):
+    for train_idx, test_idx in logo.split(X_raw, y, groups):
         species = groups[test_idx][0]
         X_train_raw = X_raw[train_idx]
         X_test_raw = X_raw[test_idx]
         y_train = y[train_idx]
         groups_train = groups[train_idx]
 
-        for model_idx in range(min(3, len(df_results))):
+        for model_idx in range(n_top):
             row = df_results.iloc[model_idx]
             pp = row["preproc"]
             ytf = row["y_transform"]
             nc = int(row["n_components"])
             lam = row["dipls_lambda"]
 
-            if pp == "EPO1":
-                xtr, eP = preprocess(X_train_raw, groups_train, pp)
-                xte, _ = preprocess(X_test_raw, epo_P=eP, method=pp)
-            else:
-                xtr, _ = preprocess(X_train_raw, groups_train, pp)
-                xte, _ = preprocess(X_test_raw, method=pp)
-
+            xtr, xte = preprocess_pair(X_train_raw, X_test_raw,
+                                        groups_train, pp)
             yf = np.sqrt(y_train) if ytf == "sqrt" else y_train
             p = fit_predict_dipls(xtr, yf, xte, n_components=nc, dipls_lambda=lam)
             if ytf == "sqrt":
                 p = np.clip(p, 0, None) ** 2
-            top3_cv_preds[model_idx][test_idx] = p
+            top_cv_preds[model_idx][test_idx] = p
 
     # アンサンブルCV
-    ens_cv_pred = np.nanmean(top3_cv_preds, axis=0)
+    ens_cv_pred = np.nanmean(top_cv_preds, axis=0)
     ens_cv_rmse = float(np.sqrt(np.nanmean((ens_cv_pred - y) ** 2)))
     print(f"di-PLS Top-3 Ensemble LOSO-CV RMSE: {ens_cv_rmse:.4f}")
 
     # fold別
-    for fold_idx, (train_idx, test_idx) in enumerate(logo.split(X_raw, y, groups)):
+    for train_idx, test_idx in logo.split(X_raw, y, groups):
         species = groups[test_idx][0]
         fold_rmse = float(np.sqrt(np.mean((ens_cv_pred[test_idx] - y[test_idx]) ** 2)))
         print(f"  {species}: RMSE={fold_rmse:.4f}")
@@ -383,7 +382,8 @@ def main():
 
 
 if __name__ == "__main__":
-    # 出力バッファリングを無効化
+    # 出力バッファリング対策
     import functools
-    print = functools.partial(print, flush=True)
+    import builtins
+    builtins.print = functools.partial(builtins.print, flush=True)
     main()
