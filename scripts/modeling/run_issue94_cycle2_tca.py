@@ -3,18 +3,7 @@
 仮説: TCA変換後の特徴空間でPLS/Ridge/Huber回帰を行えば、
 train-test間の分布差が縮小し、LBスコアが改善する。
 
-高速化戦略:
-- TCAのカーネル行列(n×n)の固有値分解がO(n^3)で非常に重い
-- 各樹種から代表サンプルをサブサンプリングしてTCA射影を学習
-- 学習した射影行列Wを使って全データを変換
-
-パラメータグリッド:
-- kernel: ['linear', 'rbf']
-- n_components: [3, 5, 10, 15, 20]
-- mu: [0.01, 0.1, 1.0, 10.0]
-- 前処理: [raw, SNV, EPO(1)]
-- 回帰: [PLS(nc=3), Ridge(alpha=1.0), HuberRegressor]
-- 目的変数: [raw, sqrt]
+高速化: サブサンプリングTCA + PCA次元削減でカーネル行列を小さくする。
 """
 import sys
 from pathlib import Path
@@ -30,6 +19,7 @@ warnings.filterwarnings("ignore")
 
 from scipy.linalg import eigh
 from sklearn.metrics.pairwise import rbf_kernel, linear_kernel
+from sklearn.decomposition import PCA
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.linear_model import Ridge, HuberRegressor
 from sklearn.model_selection import LeaveOneGroupOut
@@ -42,20 +32,18 @@ DATA_DIR = Path(__file__).resolve().parents[2] / "Input_data"
 OUT_DIR = Path(__file__).resolve().parents[2] / "outputs" / "modeling"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# サブサンプリング: 各グループからこの数のサンプルを抽出
-# eigh(n,n)の計算コスト: 100x100=0.6s, 150x150=1.7s, 200x200=2.6s
-SUBSAMPLE_PER_GROUP = 5
-MAX_SUBSAMPLE_TOTAL = 50  # source60 + target50 = 110程度を目標
+# サブサンプリング設定
+SUBSAMPLE_PER_GROUP = 3  # 各樹種3サンプル（~39 source）
+MAX_SUBSAMPLE_TARGET = 30  # target最大30サンプル
+PCA_DIM = 30  # PCA次元削減（カーネル計算高速化用）
 
 
 def rmse(a, b):
     return float(np.sqrt(np.mean((a - b) ** 2)))
 
 
-def subsample_by_group(X, groups, n_per_group=SUBSAMPLE_PER_GROUP, seed=42):
-    """各グループから代表サンプルをサブサンプリングする。
-    Returns: indices of selected samples
-    """
+def subsample_by_group(n_samples, groups, n_per_group=SUBSAMPLE_PER_GROUP, seed=42):
+    """各グループから代表サンプルをサブサンプリング"""
     rng = np.random.RandomState(seed)
     indices = []
     for g in np.unique(groups):
@@ -67,32 +55,34 @@ def subsample_by_group(X, groups, n_per_group=SUBSAMPLE_PER_GROUP, seed=42):
 
 
 def tca_transform_fast(X_source, X_target, n_components=10, kernel="rbf",
-                       gamma=None, mu=1.0, source_groups=None):
-    """サブサンプリングTCA: 代表サンプルで射影を学習し、全データに適用。
-
-    1. source/targetからサブサンプルを抽出
-    2. サブサンプルでカーネル行列・固有値問題を解く
-    3. 全データのカーネル行列を計算して射影を適用
-    """
+                       gamma=None, mu=1.0, source_groups=None, pca_dim=PCA_DIM):
+    """高速TCA: PCA次元削減 + サブサンプリング → 固有値問題 → 全データ射影"""
     n_s = len(X_source)
     n_t = len(X_target)
 
+    # PCA次元削減（全データで。TCAはラベルなし設定なのでOK）
+    X_all = np.vstack([X_source, X_target])
+    actual_pca_dim = min(pca_dim, X_all.shape[1], X_all.shape[0])
+    pca = PCA(n_components=actual_pca_dim)
+    X_all_pca = pca.fit_transform(X_all)
+    X_s_pca = X_all_pca[:n_s]
+    X_t_pca = X_all_pca[n_s:]
+
     # サブサンプリング
-    if source_groups is not None and n_s > MAX_SUBSAMPLE_TOTAL:
-        sub_s_idx = subsample_by_group(X_source, source_groups, n_per_group=SUBSAMPLE_PER_GROUP)
+    if source_groups is not None and n_s > 50:
+        sub_s_idx = subsample_by_group(n_s, source_groups,
+                                       n_per_group=SUBSAMPLE_PER_GROUP)
     else:
         sub_s_idx = np.arange(n_s)
 
-    # ターゲットもサブサンプリング
-    if n_t > MAX_SUBSAMPLE_TOTAL:
+    if n_t > MAX_SUBSAMPLE_TARGET:
         rng = np.random.RandomState(42)
-        sub_t_idx = rng.choice(n_t, size=min(MAX_SUBSAMPLE_TOTAL, n_t), replace=False)
-        sub_t_idx = np.sort(sub_t_idx)
+        sub_t_idx = np.sort(rng.choice(n_t, size=MAX_SUBSAMPLE_TARGET, replace=False))
     else:
         sub_t_idx = np.arange(n_t)
 
-    X_sub_s = X_source[sub_s_idx]
-    X_sub_t = X_target[sub_t_idx]
+    X_sub_s = X_s_pca[sub_s_idx]
+    X_sub_t = X_t_pca[sub_t_idx]
     n_sub_s = len(X_sub_s)
     n_sub_t = len(X_sub_t)
     n_sub = n_sub_s + n_sub_t
@@ -122,22 +112,20 @@ def tca_transform_fast(X_source, X_target, n_components=10, kernel="rbf",
     # 一般化固有値問題
     A = K_sub @ L @ K_sub + mu * np.eye(n_sub)
     B = K_sub @ H @ K_sub
-
     B = (B + B.T) / 2
     min_eig = np.real(np.linalg.eigvalsh(B).min())
     reg = max(1e-8, -min_eig + 1e-6) if min_eig < 1e-6 else 1e-8
     B += reg * np.eye(n_sub)
 
-    nc = min(n_components, n_sub)
+    nc = min(n_components, n_sub - 1)
     eigenvalues, eigenvectors = eigh(A, B)
     W = eigenvectors[:, :nc]
 
     # 全データのカーネル行列（全データ vs サブサンプル）
-    X_all_full = np.vstack([X_source, X_target])
     if kernel == "rbf":
-        K_full = rbf_kernel(X_all_full, X_sub_all, gamma=gamma)
+        K_full = rbf_kernel(X_all_pca, X_sub_all, gamma=gamma)
     else:
-        K_full = linear_kernel(X_all_full, X_sub_all)
+        K_full = linear_kernel(X_all_pca, X_sub_all)
 
     # 射影
     Z = K_full @ W
@@ -148,7 +136,7 @@ def tca_transform_fast(X_source, X_target, n_components=10, kernel="rbf",
 
 
 def preprocess(X_tr, X_te, groups_tr, method):
-    """前処理を適用する。trainのみでfitし、testはtransformのみ。"""
+    """前処理を適用する。"""
     if method == "raw":
         return X_tr.copy(), X_te.copy()
     elif method == "snv":
@@ -161,7 +149,6 @@ def preprocess(X_tr, X_te, groups_tr, method):
 
 
 def make_regressor(name):
-    """回帰モデルを生成する。"""
     if name == "pls3":
         return PLSRegression(n_components=3)
     elif name == "ridge":
@@ -173,7 +160,6 @@ def make_regressor(name):
 
 
 def fit_predict(model, Z_tr, y_tr, Z_te):
-    """モデルの学習と予測を行う。"""
     model.fit(Z_tr, y_tr)
     pred = model.predict(Z_te)
     if hasattr(pred, "ravel"):
@@ -185,7 +171,6 @@ def run_loso_cv(X, y, groups, kernel, n_components, mu, pp_method, reg_name, tar
     """LOSO-CVを実行してRMSEを計算する。"""
     logo = LeaveOneGroupOut()
     all_pred = np.zeros_like(y, dtype=float)
-
     fold_rmses = []
     fold_species = []
 
@@ -198,14 +183,16 @@ def run_loso_cv(X, y, groups, kernel, n_components, mu, pp_method, reg_name, tar
         # 前処理
         X_tr_pp, X_te_pp = preprocess(X_tr, X_te, g_tr, pp_method)
 
-        # TCA変換（サブサンプリング版）
-        nc = min(n_components, len(tr_idx), len(te_idx))
+        # TCA変換
+        nc = min(n_components, len(te_idx) - 1)
+        if nc < 1:
+            nc = 1
         try:
             Z_tr, Z_te = tca_transform_fast(
                 X_tr_pp, X_te_pp, n_components=nc, kernel=kernel, mu=mu,
                 source_groups=g_tr
             )
-        except Exception:
+        except Exception as e:
             return None, None, None
 
         # 目的変数変換
@@ -216,9 +203,8 @@ def run_loso_cv(X, y, groups, kernel, n_components, mu, pp_method, reg_name, tar
 
         # 回帰
         model = make_regressor(reg_name)
-        # PLS の n_components を TCA 次元に合わせる
         if reg_name == "pls3" and nc < 3:
-            model = PLSRegression(n_components=nc)
+            model = PLSRegression(n_components=max(1, nc))
 
         try:
             pred = fit_predict(model, Z_tr, y_tr_t, Z_te)
@@ -230,19 +216,16 @@ def run_loso_cv(X, y, groups, kernel, n_components, mu, pp_method, reg_name, tar
             pred = np.clip(pred, 0, None) ** 2
 
         all_pred[te_idx] = pred
-
-        fold_rmse = rmse(pred, y_te)
-        fold_rmses.append(fold_rmse)
+        fold_rmses.append(rmse(pred, y_te))
         fold_species.append(groups[te_idx][0])
 
-    overall_rmse = rmse(all_pred, y)
-    return overall_rmse, fold_rmses, fold_species
+    return rmse(all_pred, y), fold_rmses, fold_species
 
 
 def main():
     print("=" * 70)
     print("Issue #94 Cycle 2: TCA Domain Adaptation Pipeline")
-    print("(Subsampled TCA for speed)")
+    print("(PCA + Subsampled TCA)")
     print("=" * 70)
 
     t0 = time.time()
@@ -261,104 +244,49 @@ def main():
 
     print(f"Train: {X_train.shape}, Test: {X_test.shape}")
     print(f"Species (train): {np.unique(groups)}")
-    print(f"Subsample config: {SUBSAMPLE_PER_GROUP}/group, max {MAX_SUBSAMPLE_TOTAL}")
+    print(f"Config: PCA_DIM={PCA_DIM}, SUBSAMPLE={SUBSAMPLE_PER_GROUP}/group, MAX_TARGET={MAX_SUBSAMPLE_TARGET}")
     print()
 
     # ========================================
-    # Phase 1: LOSO-CV 2段階グリッドサーチ
+    # Phase 1: LOSO-CV グリッドサーチ
     # ========================================
-    print("Phase 1a: Coarse Grid Search")
+    print("Phase 1: LOSO-CV Grid Search")
     print("-" * 50)
 
-    # Stage 1: 粗いグリッド（72パターン）
-    kernels_coarse = ["linear", "rbf"]
-    nc_coarse = [5, 10, 20]
-    mus_coarse = [0.1, 1.0, 10.0]
-    preprocessings = ["raw", "snv", "epo1"]
-    regressors = ["pls3", "ridge", "huber"]
-    target_transforms = ["raw", "sqrt"]
+    configs = []
+    for kernel in ["linear", "rbf"]:
+        for nc in [3, 5, 10, 15, 20]:
+            for mu in [0.01, 0.1, 1.0, 10.0]:
+                for pp in ["raw", "snv", "epo1"]:
+                    for reg in ["pls3", "ridge", "huber"]:
+                        for tt in ["raw", "sqrt"]:
+                            configs.append((kernel, nc, mu, pp, reg, tt))
+
+    total = len(configs)
+    print(f"Total configurations: {total}")
 
     results = []
+    for i, (kernel, nc, mu, pp, reg, tt) in enumerate(configs):
+        if (i + 1) % 10 == 0:
+            elapsed = time.time() - t0
+            rate = elapsed / (i + 1)
+            eta = rate * (total - i - 1)
+            print(f"  [{i+1}/{total}] {elapsed:.0f}s elapsed, ETA {eta:.0f}s")
 
-    # 前処理をキャッシュ（各fold × 前処理の組み合わせ）
-    logo = LeaveOneGroupOut()
-    folds = list(logo.split(X_train, y_train, groups))
+        overall, fold_rmses, fold_species = run_loso_cv(
+            X_train, y_train, groups, kernel, nc, mu, pp, reg, tt
+        )
 
-    def run_grid(kernels, nc_list, mus, pps, regs, tts, label=""):
-        local_results = []
-        total = len(kernels) * len(nc_list) * len(mus) * len(pps) * len(regs) * len(tts)
-        count = 0
-        for kernel in kernels:
-            for nc in nc_list:
-                for mu in mus:
-                    for pp in pps:
-                        for reg in regs:
-                            for tt in tts:
-                                count += 1
-                                if count % 10 == 0:
-                                    elapsed = time.time() - t0
-                                    print(f"  {label}[{count}/{total}] {elapsed:.0f}s ...")
+        if overall is not None:
+            results.append({
+                "kernel": kernel, "n_components": nc, "mu": mu,
+                "preprocessing": pp, "regressor": reg, "target_transform": tt,
+                "rmse": overall, "fold_rmses": fold_rmses, "fold_species": fold_species,
+            })
 
-                                overall, fold_rmses, fold_species = run_loso_cv(
-                                    X_train, y_train, groups,
-                                    kernel, nc, mu, pp, reg, tt
-                                )
+    df_results = pd.DataFrame(results).sort_values("rmse").reset_index(drop=True)
 
-                                if overall is not None:
-                                    local_results.append({
-                                        "kernel": kernel,
-                                        "n_components": nc,
-                                        "mu": mu,
-                                        "preprocessing": pp,
-                                        "regressor": reg,
-                                        "target_transform": tt,
-                                        "rmse": overall,
-                                        "fold_rmses": fold_rmses,
-                                        "fold_species": fold_species,
-                                    })
-        return local_results
-
-    results = run_grid(kernels_coarse, nc_coarse, mus_coarse,
-                       preprocessings, regressors, target_transforms, "coarse ")
-
-    # Stage 1結果を確認
-    df_coarse = pd.DataFrame(results).sort_values("rmse").reset_index(drop=True)
-    print(f"\nCoarse search: {len(df_coarse)} valid results")
-    if len(df_coarse) > 0:
-        print(f"Best coarse RMSE: {df_coarse.iloc[0]['rmse']:.4f}")
-        top3 = df_coarse.head(3)
-        for _, r in top3.iterrows():
-            print(f"  k={r['kernel']}, nc={r['n_components']}, mu={r['mu']}, "
-                  f"pp={r['preprocessing']}, reg={r['regressor']}, tt={r['target_transform']} -> {r['rmse']:.3f}")
-
-    # Stage 2: ベスト周辺の精密探索
-    print(f"\nPhase 1b: Fine Grid Search (around best)")
-    print("-" * 50)
-
-    if len(df_coarse) > 0:
-        best_coarse = df_coarse.iloc[0]
-        # ベストカーネルの周辺で精密探索
-        best_k = best_coarse["kernel"]
-        best_nc = int(best_coarse["n_components"])
-        best_mu = best_coarse["mu"]
-        best_pp = best_coarse["preprocessing"]
-
-        # 精密nc: ベスト±の近傍
-        fine_nc = sorted(set([max(3, best_nc - 5), best_nc, best_nc + 5, best_nc + 10]))
-        # 精密mu: ベストの前後
-        mu_idx = [0.01, 0.1, 1.0, 10.0]
-        fine_mu = sorted(set([best_mu / 3, best_mu, best_mu * 3]))
-        fine_mu = [m for m in fine_mu if 0.001 <= m <= 100.0]
-
-        fine_results = run_grid([best_k], fine_nc, fine_mu,
-                                [best_pp], regressors, target_transforms, "fine ")
-        results.extend(fine_results)
-
-    # 結果をDataFrameに
-    df_results = pd.DataFrame(results)
-    df_results = df_results.sort_values("rmse").reset_index(drop=True)
-
-    print(f"\nCompleted {count} configurations, {len(df_results)} valid results")
+    print(f"\nCompleted: {len(df_results)} valid results out of {total}")
     print(f"Time: {time.time()-t0:.0f}s")
     print(f"\nTop 20 configurations by LOSO-CV RMSE:")
     print("-" * 90)
@@ -372,7 +300,6 @@ def main():
             f"{row['target_transform']:>5} {row['rmse']:>8.3f}"
         )
 
-    # ベスト設定のfold別RMSE
     best = df_results.iloc[0]
     print(f"\nBest configuration: RMSE = {best['rmse']:.4f}")
     print(f"  kernel={best['kernel']}, nc={best['n_components']}, mu={best['mu']}")
@@ -389,42 +316,26 @@ def main():
     print("Phase 2: Test Prediction (Best Config)")
     print("=" * 70)
 
-    bk = best["kernel"]
-    bnc = int(best["n_components"])
-    bmu = best["mu"]
-    bpp = best["preprocessing"]
-    breg = best["regressor"]
-    btt = best["target_transform"]
+    bk, bnc, bmu = best["kernel"], int(best["n_components"]), best["mu"]
+    bpp, breg, btt = best["preprocessing"], best["regressor"], best["target_transform"]
 
-    # 前処理
     X_tr_pp, X_te_pp = preprocess(X_train, X_test, groups, bpp)
-
-    # TCA変換（train全体 → test全体）
     Z_tr, Z_te = tca_transform_fast(
-        X_tr_pp, X_te_pp, n_components=bnc, kernel=bk, mu=bmu,
-        source_groups=groups
+        X_tr_pp, X_te_pp, n_components=bnc, kernel=bk, mu=bmu, source_groups=groups
     )
     print(f"TCA transformed: train={Z_tr.shape}, test={Z_te.shape}")
 
-    # 目的変数変換
-    if btt == "sqrt":
-        y_fit = np.sqrt(y_train)
-    else:
-        y_fit = y_train.copy()
-
-    # 回帰
+    y_fit = np.sqrt(y_train) if btt == "sqrt" else y_train.copy()
     model = make_regressor(breg)
     pred_test = fit_predict(model, Z_tr, y_fit, Z_te)
-
-    # 逆変換
     if btt == "sqrt":
         pred_test = np.clip(pred_test, 0, None) ** 2
 
-    print(f"Test predictions: min={pred_test.min():.2f}, max={pred_test.max():.2f}, "
+    print(f"Predictions: min={pred_test.min():.2f}, max={pred_test.max():.2f}, "
           f"mean={pred_test.mean():.2f}, std={pred_test.std():.2f}")
 
     # ========================================
-    # Phase 3: Top-5設定でのアンサンブルも試す
+    # Phase 3: Top-5 Ensemble
     # ========================================
     print("\n" + "=" * 70)
     print("Phase 3: Top-5 Ensemble")
@@ -438,23 +349,16 @@ def main():
             X_tr_pp, X_te_pp, n_components=nc, kernel=row["kernel"], mu=row["mu"],
             source_groups=groups
         )
-
-        if row["target_transform"] == "sqrt":
-            y_f = np.sqrt(y_train)
-        else:
-            y_f = y_train.copy()
-
+        y_f = np.sqrt(y_train) if row["target_transform"] == "sqrt" else y_train.copy()
         m = make_regressor(row["regressor"])
         p = fit_predict(m, Z_tr, y_f, Z_te)
-
         if row["target_transform"] == "sqrt":
             p = np.clip(p, 0, None) ** 2
-
         top5_preds.append(p)
-        print(f"  Config {i+1} (RMSE={row['rmse']:.3f}): pred range [{p.min():.1f}, {p.max():.1f}]")
+        print(f"  Config {i+1} (RMSE={row['rmse']:.3f}): pred [{p.min():.1f}, {p.max():.1f}]")
 
     ensemble_pred = np.mean(top5_preds, axis=0)
-    print(f"\nEnsemble predictions: min={ensemble_pred.min():.2f}, max={ensemble_pred.max():.2f}, "
+    print(f"\nEnsemble: min={ensemble_pred.min():.2f}, max={ensemble_pred.max():.2f}, "
           f"mean={ensemble_pred.mean():.2f}")
 
     # ========================================
@@ -464,36 +368,24 @@ def main():
     print("Phase 4: Submission File")
     print("=" * 70)
 
-    # ベスト単一モデル
-    submit_single = pd.DataFrame({
-        0: test_ids.astype(int),
-        1: pred_test,
-    })
+    submit_single = pd.DataFrame({0: test_ids.astype(int), 1: pred_test})
     path_single = OUT_DIR / "submission_v6_tca.csv"
     submit_single.to_csv(path_single, index=False, header=False)
-    print(f"Single best submission: {path_single}")
+    print(f"Single best: {path_single}")
 
-    # Top-5アンサンブル
-    submit_ensemble = pd.DataFrame({
-        0: test_ids.astype(int),
-        1: ensemble_pred,
-    })
+    submit_ensemble = pd.DataFrame({0: test_ids.astype(int), 1: ensemble_pred})
     path_ensemble = OUT_DIR / "submission_v6_tca_ensemble.csv"
     submit_ensemble.to_csv(path_ensemble, index=False, header=False)
-    print(f"Ensemble submission: {path_ensemble}")
+    print(f"Ensemble: {path_ensemble}")
 
-    # バリデーション
     sample_submit = pd.read_csv(DATA_DIR / "sample_submit.csv", header=None)
     assert len(submit_single) == len(sample_submit), \
         f"Row count mismatch: {len(submit_single)} vs {len(sample_submit)}"
     print(f"Validation: row count OK ({len(submit_single)} rows)")
 
     elapsed = time.time() - t0
-    print(f"\nTotal time: {elapsed:.1f}s")
+    print(f"\nTotal time: {elapsed:.1f}s ({elapsed/60:.1f}min)")
 
-    # ========================================
-    # 結果サマリーを保存
-    # ========================================
     summary_cols = ["kernel", "n_components", "mu", "preprocessing", "regressor", "target_transform", "rmse"]
     df_results[summary_cols].to_csv(OUT_DIR / "issue94_cycle2_tca_results.csv", index=False)
     print(f"Results saved: {OUT_DIR / 'issue94_cycle2_tca_results.csv'}")
