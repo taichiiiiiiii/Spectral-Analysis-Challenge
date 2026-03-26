@@ -4,8 +4,10 @@
 
 詳細は `README.md` を参照。
 
-- **現在のベストスコア**: RMSE = 17.03
+- **現在のベストLBスコア**: RMSE = 17.03（v2提出）
+- **次点LBスコア**: RMSE = 17.14（v9_top12: 12種前処理×PLS均等平均）
 - **ブランチ**: `develop`（メイン開発）
+- **Issue進捗**: #106まで（133コミット）
 
 ## 言語
 
@@ -85,20 +87,22 @@
 
 ```
 src/
-  eda/              # EDA分析モジュール
-  preprocessing/    # スペクトル前処理
-  modeling/         # モデリング
-  feature_engineering/  # 特徴量エンジニアリング
-scripts/            # 実行スクリプト（run_*）
-tests/              # ユニットテスト
+  eda/              # EDA分析モジュール（14ファイル、Issue #2〜#17）
+  preprocessing/    # スペクトル前処理（22ファイル、Issue #18〜#50, #62）
+  modeling/         # モデリング（14ファイル、Issue #26〜#66）
+  feature_engineering/  # 特徴量エンジニアリング（2ファイル、Issue #37, #41）
+scripts/            # 実行スクリプト（81ファイル）
+tests/              # ユニットテスト（64ファイル）
 Input_data/         # train.csv, test.csv, sample_submit.csv
-outputs/            # 可視化・分析結果
+outputs/            # 可視化・分析結果・提出候補（208ファイル、submission 76個）
 ```
 
 ## 技術スタック
 
 - Python 3.11+ / uv（パッケージ管理）
 - scikit-learn, scipy, numpy, pandas
+- LightGBM, diplslib（di-PLS）, PyWavelets
+- matplotlib, seaborn（可視化）
 - pytest（テスト）
 
 ## コーディング規約
@@ -139,3 +143,9 @@ outputs/            # 可視化・分析結果
 - LOSO-CV（Leave-One-Species-Out）を使用
 - ベイスギfoldは含水率が外挿領域のため参考値として扱う
 - サンプル重み付け: 不均衡比率3.6倍（ホワイトオーク51件 vs トチ183件）→ ML訓練時に重み付けを検討
+
+### アンサンブル戦略（Issue #106の知見）
+- **重み最適化はCV過学習のリスクが高い**（best11: CV=14.10→LB=21.56）
+- **均等平均のシンプルなアンサンブル**がLBとの対応が良い（v9: CV=18.29→LB=17.14）
+- **含水率類似パターンのCV**がLBスコアに最も近い指標（v9 Pattern C: CV=16.70 vs LB=17.14、差=0.44）
+- 重み最適化する場合は正則化（重みの分散ペナルティ等）を検討する
