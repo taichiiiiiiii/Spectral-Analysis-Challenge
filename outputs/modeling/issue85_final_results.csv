@@ -1,0 +1,5 @@
+method,rmse,models
+BestCombo9-W,14.159399547702124,"['M1:EPO+PLS4+sqrt', 'M3:SNV+iPLS50+PLS4+sqrt', 'M5:SNV+AsLS+siPLS+PLS5+sqrt', 'N10:PMSC+siPLS+GBR+sqrt', 'G9:SG2d+EPO+GBR+raw', 'N2:SNV+SG2d+GBR+raw', 'Gnew1:EPO+GBR150+raw', 'H2:SNV+iPLS50+Huber+sqrt', 'H1:EPO+PLS4+Huber+sqrt']"
+BestCombo10-W,14.159901443877072,"['M1:EPO+PLS4+sqrt', 'M3:SNV+iPLS50+PLS4+sqrt', 'M5:SNV+AsLS+siPLS+PLS5+sqrt', 'C1:SNV+iPLS50+PLS5+sqrt', 'N10:PMSC+siPLS+GBR+sqrt', 'G9:SG2d+EPO+GBR+raw', 'N2:SNV+SG2d+GBR+raw', 'Gnew1:EPO+GBR150+raw', 'H2:SNV+iPLS50+Huber+sqrt', 'H1:EPO+PLS4+Huber+sqrt']"
+BestCombo8-W,14.177952654444145,"['M1:EPO+PLS4+sqrt', 'M3:SNV+iPLS50+PLS4+sqrt', 'N10:PMSC+siPLS+GBR+sqrt', 'G9:SG2d+EPO+GBR+raw', 'N2:SNV+SG2d+GBR+raw', 'Gnew1:EPO+GBR150+raw', 'H2:SNV+iPLS50+Huber+sqrt', 'H1:EPO+PLS4+Huber+sqrt']"
+BestCombo7-W,14.2025942595759,"['M1:EPO+PLS4+sqrt', 'M3:SNV+iPLS50+PLS4+sqrt', 'M5:SNV+AsLS+siPLS+PLS5+sqrt', 'N10:PMSC+siPLS+GBR+sqrt', 'G9:SG2d+EPO+GBR+raw', 'Gnew1:EPO+GBR150+raw', 'H2:SNV+iPLS50+Huber+sqrt']"
