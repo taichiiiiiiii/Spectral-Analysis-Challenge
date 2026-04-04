@@ -19,24 +19,20 @@ import time
 from scipy.optimize import minimize
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.model_selection import LeaveOneGroupOut
-from src.eda.data_loader import load_train, load_test, get_spectral_columns
+from src.eda.data_loader import load_train, load_test
 from src.preprocessing.issue18_snv import apply_snv
 from src.preprocessing.issue20_savgol import apply_savgol
 from src.preprocessing.issue22_epo import compute_epo_projection, apply_epo
 from src.preprocessing.issue19_msc import compute_msc_reference, apply_msc
 from src.preprocessing.issue62_additional_preprocessing import apply_asls, apply_piecewise_msc
 from src.analysis.issue68_cv_pattern_selection import (
-    select_pattern_d_mahalanobis,
     select_pattern_e_sample_count,
     select_pattern_f_moisture_coverage,
     select_pattern_g_stable_folds,
     select_pattern_h_wood_type,
-    select_pattern_j_coral,
     select_pattern_k_spectral_homogeneity,
     select_pattern_l_wasserstein,
     select_pattern_m_correlation_stability,
-    select_pattern_n_water_band,
-    select_pattern_o_epo_residual,
 )
 
 warnings.filterwarnings("ignore")
@@ -348,41 +344,26 @@ def main():
     print("Step 2: パターン樹種セット計算")
     print("=" * 70)
 
-    pattern_d = select_pattern_d_mahalanobis(df_train, X_all, X_test, n_components=10, top_k=6)
     pattern_e = select_pattern_e_sample_count(df_train, min_samples=90)
     q25, q75 = np.percentile(y_all, [25, 75])
     pattern_f = select_pattern_f_moisture_coverage(df_train, target_min=q25, target_max=q75, coverage_threshold=1.0)
     pattern_g = select_pattern_g_stable_folds(fold_rmses, top_k=6)
     pattern_h = select_pattern_h_wood_type(TEST_SPECIES)
-    pattern_j = select_pattern_j_coral(df_train, X_all, X_test, top_k=6)
     pattern_k = select_pattern_k_spectral_homogeneity(df_train, X_all, top_k=6)
     pattern_l = select_pattern_l_wasserstein(df_train, target_distribution=y_all, top_k=6)
     pattern_m = select_pattern_m_correlation_stability(df_train, X_all, top_k=6)
-
-    # Pattern N: 水分吸収帯（5200/6900 cm⁻¹）のインデックスを取得
-    sc = get_spectral_columns(df_train)
-    wn = np.array([float(c) for c in sc])
-    water_band_idx = list(np.where(
-        ((wn >= 5000) & (wn <= 5400)) | ((wn >= 6700) & (wn <= 7100))
-    )[0])
-    pattern_n = select_pattern_n_water_band(df_train, X_all, X_test, wave_indices=water_band_idx, top_k=6)
-    pattern_o = select_pattern_o_epo_residual(df_train, X_all, X_test, n_components=1, top_k=6)
 
     all_patterns = {
         "A": ("生スペクトル類似", PATTERN_A),
         "B": ("SNV前処理後類似", PATTERN_B),
         "C": ("含水率類似", PATTERN_C),
-        "D": ("PCAマハラノビス距離", pattern_d),
         "E": ("サンプル数≥90", pattern_e),
         "F": ("含水率レンジ", pattern_f),
         "G": ("RMSE安定top6", pattern_g),
         "H": ("針葉樹_広葉樹", pattern_h),
-        "J": ("CORAL距離", pattern_j),
         "K": ("スペクトル同質性", pattern_k),
         "L": ("Wasserstein距離", pattern_l),
         "M": ("相関安定性", pattern_m),
-        "N": ("水分吸収帯", pattern_n),
-        "O": ("EPO残差類似", pattern_o),
     }
 
     # 完全重複チェック

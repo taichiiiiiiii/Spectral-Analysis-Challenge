@@ -4,12 +4,10 @@ import pandas as pd
 import pytest
 
 from src.analysis.issue68_cv_pattern_selection import (
-    select_pattern_d_mahalanobis,
     select_pattern_e_sample_count,
     select_pattern_f_moisture_coverage,
     select_pattern_g_stable_folds,
     select_pattern_h_wood_type,
-    select_pattern_i_mmd,
 )
 
 
