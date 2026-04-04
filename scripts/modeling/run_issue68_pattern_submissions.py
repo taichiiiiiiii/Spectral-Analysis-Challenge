@@ -19,7 +19,7 @@ import time
 from scipy.optimize import minimize
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.model_selection import LeaveOneGroupOut
-from src.eda.data_loader import load_train, load_test
+from src.eda.data_loader import load_train, load_test, get_spectral_columns
 from src.preprocessing.issue18_snv import apply_snv
 from src.preprocessing.issue20_savgol import apply_savgol
 from src.preprocessing.issue22_epo import compute_epo_projection, apply_epo

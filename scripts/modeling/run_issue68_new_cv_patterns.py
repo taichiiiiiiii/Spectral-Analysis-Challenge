@@ -1,15 +1,8 @@
-"""Issue #68: 新CVパターン D-I の樹種選定・CV RMSE評価
+"""Issue #68: CVパターンの樹種選定・CV RMSE評価
 
-既存パターンA-Cに加え、データ駆動型の新パターンD-Iを計算し、
+既存パターンA-Cに加え、データ駆動型の新パターンE-Mを計算し、
 各パターンのCV RMSEとLBスコアの差分を比較する。
-
-パターン:
-  D: PCA空間マハラノビス距離が近い樹種
-  E: サンプル数が極端に少ない樹種を除外
-  F: 含水率レンジがtest全体をカバーする樹種
-  G: fold RMSEのばらつきが小さい安定樹種
-  H: 針葉樹/広葉樹分類でtest樹種に近いグループ
-  I: MMD距離が小さい樹種
+（trainデータのみ使用、ルール準拠）
 """
 import sys
 from pathlib import Path
@@ -21,19 +14,20 @@ import warnings
 import time
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.model_selection import LeaveOneGroupOut
-from src.eda.data_loader import load_train, load_test, get_spectral_columns
+from src.eda.data_loader import load_train, get_spectral_columns
 from src.preprocessing.issue18_snv import apply_snv
 from src.preprocessing.issue20_savgol import apply_savgol
 from src.preprocessing.issue22_epo import compute_epo_projection, apply_epo
 from src.preprocessing.issue19_msc import compute_msc_reference, apply_msc
 from src.preprocessing.issue62_additional_preprocessing import apply_asls, apply_piecewise_msc
 from src.analysis.issue68_cv_pattern_selection import (
-    select_pattern_d_mahalanobis,
     select_pattern_e_sample_count,
     select_pattern_f_moisture_coverage,
     select_pattern_g_stable_folds,
     select_pattern_h_wood_type,
-    select_pattern_i_mmd,
+    select_pattern_k_spectral_homogeneity,
+    select_pattern_l_wasserstein,
+    select_pattern_m_correlation_stability,
 )
 
 warnings.filterwarnings("ignore")
@@ -204,38 +198,36 @@ def run_v9_pipeline(X, y, g, folds, species_list):
 # ============================================================
 # 新パターン D-I の自動計算
 # ============================================================
-def compute_new_patterns(df_train, X_train, X_test, fold_rmses):
-    """パターンD-Iの樹種セットを計算して返す"""
+def compute_new_patterns(df_train, X_train, fold_rmses):
+    """trainデータのみを使用してパターンの樹種セットを計算して返す"""
     patterns = {}
 
-    # Pattern D: PCA空間マハラノビス距離
-    patterns["D (PCAマハラノビス距離)"] = select_pattern_d_mahalanobis(
-        df_train, X_train, X_test, n_components=10, top_k=6,
-    )
-
-    # Pattern E: サンプル数フィルタ (最小50件)
     patterns["E (サンプル数≥90)"] = select_pattern_e_sample_count(
         df_train, min_samples=90,
     )
 
-    # Pattern F: 含水率レンジカバレッジ
     y_train = df_train["含水率"].values
     q25, q75 = np.percentile(y_train, [25, 75])
     patterns["F (含水率レンジ)"] = select_pattern_f_moisture_coverage(
         df_train, target_min=q25, target_max=q75, coverage_threshold=1.0,
     )
 
-    # Pattern G: fold RMSE安定樹種 (top-6)
     patterns["G (RMSE安定 top6)"] = select_pattern_g_stable_folds(
         fold_rmses, top_k=6,
     )
 
-    # Pattern H: 針葉樹/広葉樹分類
     patterns["H (針葉樹/広葉樹)"] = select_pattern_h_wood_type(TEST_SPECIES)
 
-    # Pattern I: MMD距離
-    patterns["I (MMD距離)"] = select_pattern_i_mmd(
-        df_train, X_train, X_test, top_k=6,
+    patterns["K (スペクトル同質性)"] = select_pattern_k_spectral_homogeneity(
+        df_train, X_train, top_k=6,
+    )
+
+    patterns["L (Wasserstein距離)"] = select_pattern_l_wasserstein(
+        df_train, target_distribution=y_train, top_k=6,
+    )
+
+    patterns["M (相関安定性)"] = select_pattern_m_correlation_stability(
+        df_train, X_train, top_k=6,
     )
 
     return patterns
@@ -247,12 +239,10 @@ def compute_new_patterns(df_train, X_train, X_test, fold_rmses):
 def main():
     t0 = time.time()
 
-    # データ読み込み
+    # データ読み込み（trainのみ使用）
     df_train = load_train(DATA_DIR)
-    df_test = load_test(DATA_DIR)
     sc = get_spectral_columns(df_train)
     X_train = df_train[sc].values
-    X_test = df_test[sc].values
     y = df_train["含水率"].values
     g = df_train["樹種"].values
 
@@ -260,9 +250,8 @@ def main():
     folds = list(logo.split(X_train, y, g))
     species_list = [np.unique(g[te])[0] for _, te in folds]
 
-    print(f"Train: {X_train.shape}, Test: {X_test.shape}")
+    print(f"Train: {X_train.shape}")
     print(f"Train樹種: {species_list}")
-    print(f"Test樹種: {sorted(TEST_SPECIES)}")
 
     # ---- v9パイプラインでfold別RMSE算出 ----
     v9_fold_rmses = run_v9_pipeline(X_train, y, g, folds, species_list)
@@ -275,12 +264,12 @@ def main():
         marker = " ※" if sp == "ベイスギ" else ""
         print(f"  {sp}: {v9_fold_rmses[sp]:.2f}{marker}")
 
-    # ---- 新パターン D-I の樹種セット計算 ----
+    # ---- 新パターンの樹種セット計算 ----
     print("\n" + "=" * 70)
-    print("新パターン D-I の樹種選定")
+    print("新パターンの樹種選定（trainデータのみ使用）")
     print("=" * 70)
 
-    new_patterns = compute_new_patterns(df_train, X_train, X_test, v9_fold_rmses)
+    new_patterns = compute_new_patterns(df_train, X_train, v9_fold_rmses)
 
     # 全パターン統合
     all_patterns = {
