@@ -62,12 +62,13 @@ def main():
     print("Part 1: Adversarial Validation")
     print("=" * 60)
 
-    X_all = np.vstack([X, X_test])
     y_domain = np.array([0]*len(X) + [1]*len(X_test))
 
-    # PCA次元削減
+    # PCA次元削減（trainのみでfit、testはtransform）
     pca = PCA(n_components=50, random_state=42)
-    X_all_pca = pca.fit_transform(X_all)
+    X_pca = pca.fit_transform(X)
+    X_test_pca = pca.transform(X_test)
+    X_all_pca = np.vstack([X_pca, X_test_pca])
 
     # GBCで判別
     clf = GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
