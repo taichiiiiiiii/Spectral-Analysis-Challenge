@@ -147,7 +147,6 @@ cython_debug/
 
 # Data files
 *.csv
-!Input_data/*.csv
 *.xlsx
 *.xls
 *.h5
@@ -187,11 +186,10 @@ Thumbs.db
 temp/
 tmp/
 
-# Results and submissions (adjust as needed)
+# Results and submissions
 submissions/
 results/
-outputs/
-!outputs/**/*.png
+
 # Competition data (obtain from SIGNATE; not redistributed) & generated artifacts
 Input_data/
 outputs/
